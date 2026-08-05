@@ -1,0 +1,16 @@
+{
+  "term": "2026 Spring",
+  "subject": "MATH",
+  "catalog_number": "231",
+  "observed_at": "2026-01-15T12:00:00+00:00",
+  "sections": [
+    {
+      "section": "001",
+      "seats_available": 1,
+      "seats_capacity": 30,
+      "waitlist_available": 2,
+      "waitlist_capacity": 15,
+      "status": "open"
+    }
+  ]
+}

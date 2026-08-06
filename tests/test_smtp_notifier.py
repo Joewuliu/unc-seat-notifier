@@ -77,3 +77,17 @@ def test_notify_marks_waitlist_warning_in_subject(mock_smtp_cls: MagicMock):
 
     sent = client.send_message.call_args[0][0]
     assert sent["Subject"].startswith("[waitlist warning]")
+
+
+@patch("unc_notifier.notifier.smtp.smtplib.SMTP")
+def test_notify_reports_unknown_waitlist_honestly(mock_smtp_cls: MagicMock):
+    """Real UNC data never exposes waitlist counts - the email must say "unknown,"
+    never fabricate "0/0 occupied" which would falsely claim a confirmed empty waitlist."""
+    client = mock_smtp_cls.return_value.__enter__.return_value
+    notifier = SmtpNotifier(make_config())
+
+    notifier.notify(make_event(waitlist_available=None, waitlist_capacity=None))
+
+    sent = client.send_message.call_args[0][0]
+    body = sent.get_content()
+    assert "Waitlist: unknown" in body

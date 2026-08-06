@@ -46,9 +46,17 @@ class SmtpNotifier(Notifier):
             f"{course} now has {event.seats_available}/{event.seats_capacity} seat(s) "
             f"available.\n\n"
             f"Status: {event.status}\n"
-            f"Waitlist: {event.waitlist_capacity - event.waitlist_available}/"
-            f"{event.waitlist_capacity} occupied\n"
+            f"Waitlist: {self._waitlist_summary(event)}\n"
             f"Reason: {event.reason}\n"
             f"Observed at: {event.occurred_at.isoformat()}\n"
         )
         return message
+
+    @staticmethod
+    def _waitlist_summary(event: NotificationEvent) -> str:
+        # Confirmed unavailable from UNC's real search results - never guess this is
+        # "0 people waiting" just because the fields are absent.
+        if event.waitlist_available is None or event.waitlist_capacity is None:
+            return "unknown"
+        occupied = event.waitlist_capacity - event.waitlist_available
+        return f"{occupied}/{event.waitlist_capacity} occupied"

@@ -14,8 +14,10 @@ CREATE TABLE IF NOT EXISTS section_state (
     section TEXT NOT NULL,
     seats_available INTEGER NOT NULL DEFAULT 0,
     seats_capacity INTEGER NOT NULL DEFAULT 0,
-    waitlist_available INTEGER NOT NULL DEFAULT 0,
-    waitlist_capacity INTEGER NOT NULL DEFAULT 0,
+    -- NULL means "this data source doesn't expose waitlist data" - true for UNC's
+    -- real Tiled Search results - not "confirmed zero people waiting."
+    waitlist_available INTEGER,
+    waitlist_capacity INTEGER,
     status TEXT NOT NULL DEFAULT 'unknown',
     last_seen_at TEXT,
     last_notified_at TEXT,
@@ -36,8 +38,8 @@ CREATE TABLE IF NOT EXISTS observations (
     section TEXT NOT NULL,
     seats_available INTEGER NOT NULL,
     seats_capacity INTEGER NOT NULL,
-    waitlist_available INTEGER NOT NULL,
-    waitlist_capacity INTEGER NOT NULL,
+    waitlist_available INTEGER,
+    waitlist_capacity INTEGER,
     status TEXT NOT NULL,
     observed_at TEXT NOT NULL
 );

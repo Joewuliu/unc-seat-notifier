@@ -74,18 +74,32 @@ class WatchEntry:
 
 @dataclass(frozen=True, slots=True)
 class SeatSnapshot:
-    """A single section's data from one successful, validated fetch."""
+    """A single section's data from one successful, validated fetch.
+
+    ``waitlist_available``/``waitlist_capacity`` are ``None`` when the data source
+    doesn't expose waitlist data at all (true for UNC's real Tiled Search results -
+    confirmed absent from every public view checked). ``None`` is treated as "no
+    active waitlist" for policy-suppression purposes (see ``waitlist_active``), but
+    callers building user-facing content should check ``waitlist_status_unknown``
+    separately so "confirmed empty" is never confused with "we can't tell."
+    """
 
     section_key: SectionKey
     seats_available: int
     seats_capacity: int
-    waitlist_available: int
-    waitlist_capacity: int
+    waitlist_available: int | None
+    waitlist_capacity: int | None
     status: str
     observed_at: datetime
 
     @property
+    def waitlist_status_unknown(self) -> bool:
+        return self.waitlist_available is None or self.waitlist_capacity is None
+
+    @property
     def people_on_waitlist(self) -> int:
+        if self.waitlist_status_unknown:
+            return 0
         return max(self.waitlist_capacity - self.waitlist_available, 0)
 
     @property
@@ -129,8 +143,8 @@ class SectionState:
     section_key: SectionKey
     seats_available: int
     seats_capacity: int
-    waitlist_available: int
-    waitlist_capacity: int
+    waitlist_available: int | None
+    waitlist_capacity: int | None
     status: str
     last_seen_at: datetime | None
     last_notified_at: datetime | None
@@ -166,8 +180,8 @@ class NotificationEvent:
     section_key: SectionKey
     seats_available: int
     seats_capacity: int
-    waitlist_available: int
-    waitlist_capacity: int
+    waitlist_available: int | None
+    waitlist_capacity: int | None
     status: str
     reason: str
     level: str

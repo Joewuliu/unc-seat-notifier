@@ -91,3 +91,31 @@ def test_notify_reports_unknown_waitlist_honestly(mock_smtp_cls: MagicMock):
     sent = client.send_message.call_args[0][0]
     body = sent.get_content()
     assert "Waitlist: unknown" in body
+
+
+@patch("unc_notifier.notifier.smtp.smtplib.SMTP")
+def test_send_test_email_uses_fixed_subject_and_labeled_body(mock_smtp_cls: MagicMock):
+    client = mock_smtp_cls.return_value.__enter__.return_value
+    notifier = SmtpNotifier(make_config())
+
+    notifier.send_test_email()
+
+    client.send_message.assert_called_once()
+    sent = client.send_message.call_args[0][0]
+    assert sent["Subject"] == "[UNC Seat Notifier] Test Email"
+    assert sent["From"] == "bot@example.com"
+    assert sent["To"] == "me@example.com"
+    body = sent.get_content().lower()
+    assert "configuration test" in body
+    assert "not a real" in body or "not a real seat" in body
+
+
+@patch("unc_notifier.notifier.smtp.smtplib.SMTP")
+def test_send_test_email_uses_tls_and_login_like_notify(mock_smtp_cls: MagicMock):
+    client = mock_smtp_cls.return_value.__enter__.return_value
+    notifier = SmtpNotifier(make_config())
+
+    notifier.send_test_email()
+
+    client.starttls.assert_called_once()
+    client.login.assert_called_once_with("user", "secret")

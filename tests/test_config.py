@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from unc_notifier.config import ConfigError, load_config, load_scraper_config, load_watches
+from unc_notifier.config import (
+    ConfigError,
+    load_config,
+    load_scraper_config,
+    load_smtp_config,
+    load_watches,
+)
 from unc_notifier.models import WaitlistPolicy
 
 MINIMAL_ENV = """
@@ -112,6 +118,57 @@ def test_load_scraper_config_ignores_invalid_smtp_values(tmp_path):
 
     with pytest.raises(ConfigError, match="SMTP_PORT"):
         load_config(env_path)
+
+
+def test_load_smtp_config_succeeds_with_only_smtp_values(tmp_path):
+    env_path = write_env(
+        tmp_path,
+        "SMTP_HOST=smtp.example.com\nSMTP_PORT=587\n"
+        "SMTP_FROM=bot@example.com\nSMTP_TO=me@example.com\n",
+    )
+
+    config = load_smtp_config(env_path)
+
+    assert config.host == "smtp.example.com"
+    assert config.port == 587
+    assert config.from_addr == "bot@example.com"
+    assert config.to_addr == "me@example.com"
+    assert config.username is None
+
+
+def test_load_smtp_config_ignores_missing_contact_email_and_database_settings(tmp_path):
+    """An .env with only SMTP_* values - no CONTACT_EMAIL, no DB_PATH - must load
+    successfully. load_config() would reject this same file."""
+    env_path = write_env(
+        tmp_path,
+        "SMTP_HOST=smtp.example.com\nSMTP_PORT=587\n"
+        "SMTP_FROM=bot@example.com\nSMTP_TO=me@example.com\n",
+    )
+
+    load_smtp_config(env_path)  # must not raise
+
+    with pytest.raises(ConfigError, match="CONTACT_EMAIL"):
+        load_config(env_path)
+
+
+def test_load_smtp_config_missing_smtp_host_raises_clear_config_error(tmp_path):
+    env_path = write_env(
+        tmp_path, "SMTP_PORT=587\nSMTP_FROM=bot@example.com\nSMTP_TO=me@example.com\n"
+    )
+
+    with pytest.raises(ConfigError, match="SMTP_HOST"):
+        load_smtp_config(env_path)
+
+
+def test_load_smtp_config_invalid_smtp_port_raises_config_error(tmp_path):
+    env_path = write_env(
+        tmp_path,
+        "SMTP_HOST=smtp.example.com\nSMTP_PORT=not-a-number\n"
+        "SMTP_FROM=bot@example.com\nSMTP_TO=me@example.com\n",
+    )
+
+    with pytest.raises(ConfigError, match="SMTP_PORT"):
+        load_smtp_config(env_path)
 
 
 WATCHES_YAML = """

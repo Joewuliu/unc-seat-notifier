@@ -5,8 +5,10 @@ config/logging/db/notifier/scraper plumbing works, not real network behavior."""
 
 from __future__ import annotations
 
+import smtplib
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -462,3 +464,136 @@ def test_poll_once_dry_run_fetch_error_does_not_corrupt_prior_state(
     assert state is not None
     assert state.seats_available == 3  # unchanged from run 1
     assert state.last_seen_at is not None
+
+
+# --- test-email ----------------------------------------------------------------------
+
+SMTP_ONLY_ENV = (
+    "SMTP_HOST=smtp.example.com\n"
+    "SMTP_PORT=587\n"
+    "SMTP_FROM=bot@example.com\n"
+    "SMTP_TO=me@example.com\n"
+    "SMTP_USERNAME=smtpuser\n"
+    "SMTP_PASSWORD=super-secret-password\n"
+)
+
+
+def write_smtp_env(tmp_path, *, extra: str = "") -> Path:
+    """An SMTP-only .env - no CONTACT_EMAIL, no database settings. Used by the
+    test-email tests below, which must work without any of that configured."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(SMTP_ONLY_ENV + extra)
+    return env_path
+
+
+def _mock_smtp(monkeypatch) -> MagicMock:
+    """Patches smtplib.SMTP so SmtpNotifier really runs (real message, real
+    connect/tls/login/send_message call sequence) without touching a real socket."""
+    mock_smtp_cls = MagicMock()
+    monkeypatch.setattr("unc_notifier.notifier.smtp.smtplib.SMTP", mock_smtp_cls)
+    return mock_smtp_cls.return_value.__enter__.return_value
+
+
+def test_test_email_sends_clearly_labeled_message_on_success(tmp_path, capsys, monkeypatch):
+    client = _mock_smtp(monkeypatch)
+    env_path = write_smtp_env(tmp_path)
+
+    exit_code = main(["test-email", "--env-file", str(env_path)])
+
+    assert exit_code == 0
+    client.send_message.assert_called_once()
+    sent = client.send_message.call_args[0][0]
+    assert sent["Subject"] == "[UNC Seat Notifier] Test Email"
+    body = sent.get_content().lower()
+    assert "configuration test" in body
+    assert "not a real" in body
+
+    out = capsys.readouterr().out
+    assert "Test email sent successfully." in out
+
+
+def test_test_email_smtp_failure_exits_nonzero_with_clear_message(tmp_path, capsys, monkeypatch):
+    client = _mock_smtp(monkeypatch)
+    client.send_message.side_effect = smtplib.SMTPException("relay refused")
+    env_path = write_smtp_env(tmp_path)
+
+    exit_code = main(["test-email", "--env-file", str(env_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "SMTP test email failed" in err
+    assert "relay refused" in err
+    out = capsys.readouterr().out
+    assert "sent successfully" not in out
+
+
+def test_test_email_missing_configuration_exits_nonzero(tmp_path, capsys):
+    env_path = tmp_path / ".env"
+    env_path.write_text("SOME_OTHER_VAR=1\n")
+
+    exit_code = main(["test-email", "--env-file", str(env_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Configuration error" in err
+    assert "SMTP_HOST" in err
+
+
+def test_test_email_never_prints_smtp_password_on_success(tmp_path, capsys, monkeypatch):
+    _mock_smtp(monkeypatch)
+    env_path = write_smtp_env(tmp_path)
+
+    exit_code = main(["test-email", "--env-file", str(env_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "super-secret-password" not in out
+    assert "smtpuser" not in out
+
+
+def test_test_email_redacts_password_from_error_output(tmp_path, capsys, monkeypatch):
+    """Even if the SMTP error message itself happened to echo the password (e.g. a
+    misconfigured relay bouncing back what it received), it must never reach stderr
+    unredacted."""
+    client = _mock_smtp(monkeypatch)
+    client.send_message.side_effect = smtplib.SMTPAuthenticationError(
+        535, b"auth failed for password super-secret-password"
+    )
+    env_path = write_smtp_env(tmp_path)
+
+    exit_code = main(["test-email", "--env-file", str(env_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "super-secret-password" not in err
+    assert "REDACTED" in err
+
+
+def test_test_email_never_constructs_scraper_repository_poller_or_sqlite(
+    tmp_path, monkeypatch
+):
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("must not be called by test-email")
+
+    _mock_smtp(monkeypatch)
+    monkeypatch.setattr("unc_notifier.cli.UncClassSearchScraper", _must_not_be_called)
+    monkeypatch.setattr("unc_notifier.cli.Repository", _must_not_be_called)
+    monkeypatch.setattr("unc_notifier.cli.Poller", _must_not_be_called)
+    monkeypatch.setattr("unc_notifier.cli.connect", _must_not_be_called)
+    env_path = write_smtp_env(tmp_path)
+
+    exit_code = main(["test-email", "--env-file", str(env_path)])
+
+    assert exit_code == 0
+
+
+def test_test_email_does_not_read_watches_yaml(tmp_path, monkeypatch):
+    """No watches.yaml exists at all in this tmp_path - if test-email tried to read
+    one, it would fail with a ConfigError, not succeed."""
+    _mock_smtp(monkeypatch)
+    env_path = write_smtp_env(tmp_path)
+    assert not (tmp_path / "watches.yaml").exists()
+
+    exit_code = main(["test-email", "--env-file", str(env_path)])
+
+    assert exit_code == 0

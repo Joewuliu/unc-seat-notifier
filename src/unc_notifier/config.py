@@ -50,6 +50,7 @@ class ScraperConfig:
 
 
 _REQUIRED = ("CONTACT_EMAIL", "SMTP_HOST", "SMTP_PORT", "SMTP_FROM", "SMTP_TO")
+_SMTP_REQUIRED = ("SMTP_HOST", "SMTP_PORT", "SMTP_FROM", "SMTP_TO")
 
 
 def _bool(value: str) -> bool:
@@ -74,6 +75,33 @@ def load_scraper_config(env_path: str | Path | None = None) -> ScraperConfig:
         raise ConfigError("Missing required .env value: CONTACT_EMAIL")
 
     return ScraperConfig(contact_email=contact_email)
+
+
+def load_smtp_config(env_path: str | Path | None = None) -> SmtpConfig:
+    """Read only the SMTP_* values from .env/environment. Used by test-email, which
+    must be runnable without CONTACT_EMAIL, watches.yaml, or any database
+    configuration - see load_config() for the full poll-command configuration, which
+    this deliberately does not call."""
+    values = _load_env_values(env_path)
+
+    missing = [key for key in _SMTP_REQUIRED if not values.get(key)]
+    if missing:
+        raise ConfigError(f"Missing required .env value(s): {', '.join(missing)}")
+
+    try:
+        smtp_port = int(values["SMTP_PORT"])
+    except ValueError as exc:
+        raise ConfigError(f"SMTP_PORT must be an integer, got {values['SMTP_PORT']!r}") from exc
+
+    return SmtpConfig(
+        host=values["SMTP_HOST"],
+        port=smtp_port,
+        username=values.get("SMTP_USERNAME") or None,
+        password=values.get("SMTP_PASSWORD") or None,
+        use_tls=_bool(values.get("SMTP_USE_TLS", "true")),
+        from_addr=values["SMTP_FROM"],
+        to_addr=values["SMTP_TO"],
+    )
 
 
 def load_config(env_path: str | Path | None = None) -> AppConfig:

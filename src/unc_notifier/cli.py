@@ -13,6 +13,10 @@ the production database.
 state machine (diff.evaluate), and a real Repository together for one section - but
 only against an explicitly supplied --db-path, and prints notifications to the console
 instead of sending email via SmtpNotifier.
+
+`python -m unc_notifier test-email` sends exactly one clearly-labeled test email via
+the real SmtpNotifier, to verify SMTP configuration. Never scrapes UNC, reads
+watches.yaml, or touches SQLite.
 """
 
 from __future__ import annotations
@@ -26,7 +30,13 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from unc_notifier import diff
-from unc_notifier.config import ConfigError, load_config, load_scraper_config, load_watches
+from unc_notifier.config import (
+    ConfigError,
+    load_config,
+    load_scraper_config,
+    load_smtp_config,
+    load_watches,
+)
 from unc_notifier.logging_setup import configure_logging
 from unc_notifier.models import (
     CourseKey,
@@ -38,7 +48,7 @@ from unc_notifier.models import (
     WaitlistPolicy,
 )
 from unc_notifier.notifier.console import ConsoleNotifier
-from unc_notifier.notifier.smtp import SmtpNotifier
+from unc_notifier.notifier.smtp import SmtpConfig, SmtpNotifier
 from unc_notifier.poller import Poller, PollerConfig
 from unc_notifier.scraper.base import FetchError
 from unc_notifier.scraper.unc import UncClassSearchScraper
@@ -157,6 +167,46 @@ def _format_snapshot(snapshot: SeatSnapshot) -> str:
         f"section {key.section}: {snapshot.seats_available}/{snapshot.seats_capacity} "
         f"seats available (status={snapshot.status}, waitlist={waitlist})"
     )
+
+
+def _run_test_email(args: argparse.Namespace) -> int:
+    """Sends exactly one clearly-labeled configuration-test email via the real
+    SmtpNotifier. Uses load_smtp_config(), not load_config(): CONTACT_EMAIL,
+    watches.yaml, and database settings are neither read nor required. Never imports
+    or constructs UncClassSearchScraper, Repository, Poller, or a SQLite connection -
+    there is nothing in this function's code path capable of touching any of them."""
+    try:
+        smtp_config = load_smtp_config(args.env_file)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Sending test email via {smtp_config.host}:{smtp_config.port} "
+        f"to {smtp_config.to_addr}..."
+    )
+    try:
+        SmtpNotifier(smtp_config).send_test_email()
+    except Exception as exc:  # noqa: BLE001 - report cleanly, never a raw traceback
+        message = _redact_secrets(f"{type(exc).__name__}: {exc}", smtp_config)
+        print(f"SMTP test email failed: {message}", file=sys.stderr)
+        return 1
+
+    # Only printed once send_test_email() has returned without raising - smtplib's
+    # send_message() itself raises on anything the server didn't accept, so reaching
+    # here means the server actually confirmed the send.
+    print("Test email sent successfully.")
+    return 0
+
+
+def _redact_secrets(text: str, config: SmtpConfig) -> str:
+    """Never let SMTP_USERNAME/SMTP_PASSWORD reach printed output, even indirectly via
+    an exception's string representation (e.g. a relay echoing back what it received)."""
+    redacted = text
+    for secret in (config.password, config.username):
+        if secret:
+            redacted = redacted.replace(secret, "***REDACTED***")
+    return redacted
 
 
 def _run_poll_once_dry_run(args: argparse.Namespace) -> int:
@@ -348,6 +398,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     dry_run_parser.set_defaults(func=_run_poll_once_dry_run)
+
+    test_email_parser = subparsers.add_parser(
+        "test-email",
+        help=(
+            "Send one clearly-labeled test email via the real SmtpNotifier, to "
+            "verify SMTP configuration. Never scrapes UNC, reads watches.yaml, or "
+            "touches SQLite."
+        ),
+    )
+    test_email_parser.add_argument(
+        "--env-file", default=None, help="Path to .env (default: .env in the current directory)"
+    )
+    test_email_parser.set_defaults(func=_run_test_email)
 
     return parser
 

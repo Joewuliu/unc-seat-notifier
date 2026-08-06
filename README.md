@@ -58,3 +58,22 @@ like a real poll cycle would (first run records a baseline with no notification;
 later run only notifies on a genuine transition into availability, subject to the same
 cooldown/retry rules the real poller uses). Point `--db-path` at a scratch file (or
 delete it) to start over.
+
+### `test-email`
+
+Sends exactly one clearly-labeled test email via the real `SmtpNotifier`, to verify
+SMTP configuration. Only requires `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_TO` (and
+`SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_USE_TLS` if your relay needs them) - it does not
+read `CONTACT_EMAIL`, `watches.yaml`, or any database setting, and never constructs
+`UncClassSearchScraper`, `Repository`, `Poller`, or a SQLite connection.
+
+```
+python -m unc_notifier test-email
+```
+
+The email's subject is always `[UNC Seat Notifier] Test Email` and its body states
+plainly that it's a configuration test, not a real seat alert. Prints
+`Test email sent successfully.` only after the SMTP server has actually accepted the
+message (i.e. `smtplib`'s send call returned without raising); on failure it prints a
+clear `SMTP test email failed: ...` message to stderr and exits non-zero.
+`SMTP_USERNAME`/`SMTP_PASSWORD` are never printed, including inside error messages.

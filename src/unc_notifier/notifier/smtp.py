@@ -26,7 +26,24 @@ class SmtpNotifier(Notifier):
         self._config = config
 
     def notify(self, event: NotificationEvent) -> None:
-        message = self._build_message(event)
+        self._send(self._build_message(event))
+
+    def send_test_email(self) -> None:
+        """Sends exactly one clearly-labeled configuration-test email - never a real
+        seat alert. Used by the `test-email` CLI command to verify SMTP settings."""
+        message = EmailMessage()
+        message["Subject"] = "[UNC Seat Notifier] Test Email"
+        message["From"] = self._config.from_addr
+        message["To"] = self._config.to_addr
+        message.set_content(
+            "This is a configuration test email from unc-seat-notifier.\n\n"
+            "It confirms your SMTP settings are working correctly. This is NOT a "
+            "real seat availability alert - no course was checked and no seat has "
+            "opened.\n"
+        )
+        self._send(message)
+
+    def _send(self, message: EmailMessage) -> None:
         with smtplib.SMTP(self._config.host, self._config.port, timeout=30) as client:
             if self._config.use_tls:
                 client.starttls()

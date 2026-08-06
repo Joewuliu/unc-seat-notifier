@@ -1,8 +1,8 @@
 # Project Status
 
-Last updated: 2026-08-06 (before context compaction). Facts below were verified
-directly (pytest/ruff run, git status/log, file listing) at time of writing, not
-recalled from memory.
+Last updated: 2026-08-06 (mid-session, after adding `test-email`). Facts below were
+verified directly (pytest/ruff run, git status/log, file listing) at time of writing,
+not recalled from memory.
 
 ## 1. Current architecture and implemented commands
 
@@ -18,9 +18,9 @@ src/unc_notifier/
                         # No I/O, no wall-clock reads.
   poller.py              # orchestration: dedup courses, fetch, diff, persist, notify.
                         # Course-level fetch-health circuit breaker + backoff.
-  config.py               # .env loading. Two loaders (see decisions below).
+  config.py               # .env loading. Three loaders (see decisions below).
   logging_setup.py         # JSON-lines structured logging to file.
-  cli.py                    # argparse entrypoint, 3 subcommands (below).
+  cli.py                    # argparse entrypoint, 4 subcommands (below).
   __main__.py                # enables `python -m unc_notifier ...`
   scraper/
     base.py                   # abstract Scraper + FetchError
@@ -50,19 +50,27 @@ src/unc_notifier/
   would-notify, final state). `ConsoleNotifier` instead of SMTP. `--db-path` is
   `required=True` in argparse — there is no default, so it structurally cannot touch
   the production database. Also uses `ScraperConfig`.
+- `test-email [--env-file]` — sends exactly one email, subject
+  `[UNC Seat Notifier] Test Email`, via the real `SmtpNotifier.send_test_email()`.
+  Uses `SmtpConfig` (`load_smtp_config`) — only needs `SMTP_HOST`/`PORT`/`FROM`/`TO`
+  (+ optional `SMTP_USERNAME`/`PASSWORD`/`USE_TLS`). Never reads `CONTACT_EMAIL` or
+  `watches.yaml`; never constructs `UncClassSearchScraper`, `Repository`, `Poller`, or
+  a SQLite connection. Error output is passed through `_redact_secrets()` so
+  `SMTP_USERNAME`/`SMTP_PASSWORD` can never reach stdout/stderr, even indirectly via an
+  exception's string representation.
 
 ## 2. Key design decisions
 
 **Tiled Search endpoint + CSRF/session flow.** The real data source is
 `https://reports.unc.edu/class-search/tiled/`, not the originally-assumed JSON API
-(SPEC.md's assumption was wrong; confirmed via captured fixtures — see SPEC-vs-reality
-notes below). Standard Django CSRF double-submit: one `requests.Session` GETs the page
-once to obtain `csrfmiddlewaretoken` + the session cookie, then POSTs
-`term`/`subject`/`catalog_number`. `UncClassSearchScraper` primes the session at most
-once per instance lifetime and reuses it for every subsequent `fetch_course()` call —
-since the CLI is single-shot-per-process, this gives "once per poll run" for free.
-Tiled Search was chosen over Standard/Advanced Search specifically because it's the
-only view that exposes seat *capacity* (`N/M available seats`), not just seats-available.
+(SPEC.md's assumption was wrong; confirmed via captured fixtures). Standard Django
+CSRF double-submit: one `requests.Session` GETs the page once to obtain
+`csrfmiddlewaretoken` + the session cookie, then POSTs `term`/`subject`/`catalog_number`.
+`UncClassSearchScraper` primes the session at most once per instance lifetime and
+reuses it for every subsequent `fetch_course()` call — since the CLI is
+single-shot-per-process, this gives "once per poll run" for free. Tiled Search was
+chosen over Standard/Advanced Search specifically because it's the only view that
+exposes seat *capacity* (`N/M available seats`), not just seats-available.
 
 **Waitlist fields are nullable (`int | None`), not required ints.** Confirmed via
 three real captured views (Standard, Advanced, Tiled search) that UNC's public search
@@ -88,6 +96,21 @@ whitespace-separated tokens); unparseable `N/M available seats` text. A legitima
 zero-results page (jumbotron containing "No results found.", confirmed to have zero
 cards) returns `[]` — a valid success, not an error.
 
+**Config loading is split by command, not shared.** Three independent loaders in
+`config.py`, each reading only what its command needs and each raising `ConfigError`
+if that (and only that) subset is missing/invalid: `load_config()` (full `AppConfig` —
+`poll`), `load_scraper_config()` (`ScraperConfig`, just `CONTACT_EMAIL` — `scrape-once`,
+`poll-once-dry-run`), `load_smtp_config()` (`SmtpConfig`, just `SMTP_*` — `test-email`).
+None of the three call each other; each duplicates a small amount of validation logic
+rather than sharing it, so that e.g. broken `SMTP_PORT` can never block `scrape-once`
+and a missing `CONTACT_EMAIL` can never block `test-email`. `_load_env_values()` is the
+one genuinely shared helper (just the `.env` + process-environment merge).
+
+**`SmtpNotifier.notify()` and `.send_test_email()` share one `_send()` method** for
+the actual connect/TLS/login/`send_message()` sequence, so `test-email` exercises the
+exact same SMTP transport code path as real seat-alert emails — only the message
+content (fixed subject/body vs. per-event content) differs.
+
 Other decisions carried from earlier in the build (still in effect, not restated in
 detail here): `last_notification_attempt_at` is stamped by the poller immediately
 before calling `notifier.notify()`, never by the pure `diff.evaluate()`; course-level
@@ -106,41 +129,49 @@ observed; SQLite via stdlib `sqlite3`, not an ORM.
 | `unc_class_search_tiled_subject_all.html` | Real Tiled Search, unfiltered by catalog number: 47 courses / 324 sections. Proves zero-available rendering (`0/<capacity>`, no special "Closed" text), alphanumeric catalog numbers (`89H`, `283H`), and result-count validation at real scale. |
 | `unc_class_search_tiled_zero_results.html` | Real Tiled Search with no matches. Proves the "No results found." jumbotron path returns `[]`, not `FetchError`. |
 
+(`test-email` needed no new fixtures — its tests mock `smtplib.SMTP` directly, same
+pattern as the existing `SmtpNotifier` tests.)
+
 ## 4. Test count and last run results
 
 ```
-pytest -q  → 121 passed
+pytest -q  → 134 passed
 ruff check .  → All checks passed
 ```
 
-Per-file breakdown (`grep -c '^def test_'`): test_cli.py 17, test_config.py 13,
+Per-file breakdown (`grep -c '^def test_'`): test_cli.py 24, test_config.py 17,
 test_console_notifier.py 3, test_diff.py 15, test_logging_setup.py 2, test_poller.py 27,
-test_repository.py 13, test_scraper_fake.py 5, test_smtp_notifier.py 4,
-test_tiled_parser.py 13, test_unc_scraper.py 9. Sum = 121.
+test_repository.py 13, test_scraper_fake.py 5, test_smtp_notifier.py 6,
+test_tiled_parser.py 13, test_unc_scraper.py 9. Sum = 134.
 
 ## 5. Work completed but not committed
 
-Last commit: `b4fc8d8 Implement live UNC scraper and safe smoke test`. Uncommitted
-since then (the `poll-once-dry-run` command, this session):
+Last commit: `171b0cb Add safe end-to-end polling dry run` (this includes the
+`poll-once-dry-run` command, `ConsoleNotifier`, and the previous revision of this
+status file — that work is now committed, unlike what an earlier version of this
+document said). Uncommitted since then (the `test-email` command, this session):
 
 ```
  M README.md
  M src/unc_notifier/cli.py
+ M src/unc_notifier/config.py
+ M src/unc_notifier/notifier/smtp.py
  M tests/test_cli.py
-?? src/unc_notifier/notifier/console.py
-?? tests/test_console_notifier.py
+ M tests/test_config.py
+ M tests/test_smtp_notifier.py
 ```
 
-Nothing has been committed at the user's explicit direction throughout this session.
+(Plus this file.) Nothing has been committed at the user's explicit direction
+throughout this session.
 
 ## 6. Next planned phase
 
 Not yet decided/started. No later phase (web app, signup, scheduling/deployment
-automation) has been scoped or begun — explicitly deferred each time it came up. The
-immediate open item, not yet acted on, is whether to pursue real fixtures for a
-full/closed section rendering edge case beyond what `unc_class_search_tiled_subject_all.html`
-already covers, and whether the user wants to move to committing this work or continue
-adding diagnostic/dry-run tooling before touching the real `poll` cron path in
+automation) has been scoped or begun — explicitly deferred each time it came up. Open
+items, not yet acted on: whether to pursue a dedicated fixture isolating a single
+full/closed section card (beyond what `unc_class_search_tiled_subject_all.html`
+already covers), and whether the user wants to move to committing this work or
+continue adding diagnostic tooling before touching the real `poll` cron path in
 production.
 
 ## 7. Commands to verify locally
@@ -156,6 +187,9 @@ production.
 ./.venv/Scripts/python.exe -m unc_notifier poll-once-dry-run \
   --term "2026 Fall" --subject COMP --catalog-number 210 --section 001 \
   --db-path .tmp/dry-run-test.db
+
+# SMTP configuration test (only needs SMTP_* in .env, sends one real email):
+./.venv/Scripts/python.exe -m unc_notifier test-email
 ```
 
 ## 8. Known limitations / technical debt
@@ -183,5 +217,10 @@ production.
 - **Wire-level request requirements aren't fully confirmed** — `Referer` header is
   sent proactively as a defensive guess (Django CSRF sometimes requires it on HTTPS)
   but this hasn't been empirically forced to fail without it.
+- **`_redact_secrets()` is a simple substring replace**, applied only within
+  `_run_test_email`'s own exception-message formatting. It protects the one place a
+  secret could plausibly leak in this command (an SMTP error message echoing input),
+  but it is not a general-purpose logging filter — if `test-email` or `SmtpNotifier`
+  gains new output paths later, each would need the same treatment explicitly.
 - `.env` currently open in the user's editor is presumed to hold real local
   configuration; not inspected or read as part of this status file.

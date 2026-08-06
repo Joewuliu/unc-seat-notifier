@@ -17,6 +17,13 @@ instead of sending email via SmtpNotifier.
 `python -m unc_notifier test-email` sends exactly one clearly-labeled test email via
 the real SmtpNotifier, to verify SMTP configuration. Never scrapes UNC, reads
 watches.yaml, or touches SQLite.
+
+`python -m unc_notifier poll-once-live` runs the real end-to-end poll (real scraper,
+real Repository, real Poller.apply_snapshot(), real SmtpNotifier) for one section
+against an explicitly supplied --db-path, gated behind --confirm-send-email. Its
+--seed-closed-state mode (gated behind --confirm-seed) writes a synthetic prior closed
+state with no network call, so a later live run can demonstrate a real closed-to-open
+email.
 """
 
 from __future__ import annotations
@@ -46,19 +53,21 @@ from unc_notifier.models import (
     SectionKey,
     SectionState,
     WaitlistPolicy,
+    WatchEntry,
 )
 from unc_notifier.notifier.console import ConsoleNotifier
 from unc_notifier.notifier.smtp import SmtpConfig, SmtpNotifier
-from unc_notifier.poller import Poller, PollerConfig
+from unc_notifier.poller import Poller, PollerConfig, PollSummary
 from unc_notifier.scraper.base import FetchError
 from unc_notifier.scraper.unc import UncClassSearchScraper
 from unc_notifier.state.repository import Repository, connect
 
-# Fixed defaults for poll-once-dry-run, which has no PollerConfig of its own - this is
-# a single-section diagnostic tool, not a configurable production pipeline.
-_DRY_RUN_COOLDOWN = timedelta(minutes=30)
-_DRY_RUN_RETRY_DELAY = timedelta(minutes=5)
-_DRY_RUN_WAITLIST_POLICY = WaitlistPolicy.ALERT
+# Fixed defaults for poll-once-dry-run and poll-once-live, neither of which has a
+# PollerConfig of its own - these are single-section diagnostic tools, not a
+# configurable production pipeline.
+_SINGLE_SECTION_COOLDOWN = timedelta(minutes=30)
+_SINGLE_SECTION_RETRY_DELAY = timedelta(minutes=5)
+_SINGLE_SECTION_WAITLIST_POLICY = WaitlistPolicy.ALERT
 
 logger = logging.getLogger("unc_notifier.cli")
 
@@ -270,9 +279,9 @@ def _run_poll_once_dry_run(args: argparse.Namespace) -> int:
     decision = diff.evaluate(
         prev_for_diff,
         snapshot,
-        waitlist_policy=_DRY_RUN_WAITLIST_POLICY,
-        cooldown=_DRY_RUN_COOLDOWN,
-        retry_delay=_DRY_RUN_RETRY_DELAY,
+        waitlist_policy=_SINGLE_SECTION_WAITLIST_POLICY,
+        cooldown=_SINGLE_SECTION_COOLDOWN,
+        retry_delay=_SINGLE_SECTION_RETRY_DELAY,
     )
     print(f"Notification decision: reason={decision.reason} level={decision.notify_level or '-'}")
     print(f"Would notify: {decision.should_attempt_notify}")
@@ -335,6 +344,175 @@ def _format_transition(was_available: bool | None, is_available: bool) -> str:
     if was_available == is_available:
         return f"no change ({'available' if is_available else 'unavailable'})"
     return "unavailable -> available" if is_available else "available -> unavailable"
+
+
+def _run_poll_once_live(args: argparse.Namespace) -> int:
+    """Runs the real end-to-end poll for exactly one section: real
+    UncClassSearchScraper, real Repository, real Poller.apply_snapshot() (so
+    notification-resolution logic is never re-implemented here - see
+    PROJECT_STATUS.md), and the real SmtpNotifier.
+
+    Requires --db-path (no default - never falls back to the production database) and,
+    for a real live run, --confirm-send-email: without it the command refuses to run
+    at all, before fetching anything or constructing SmtpNotifier.
+    --seed-closed-state is a separate, network-free test-setup mode gated by its own
+    --confirm-seed flag - see _seed_closed_state().
+    """
+    print(f"Database: {args.db_path}")
+    section_key = SectionKey(
+        term=args.term, subject=args.subject, catalog_number=args.catalog_number,
+        section=args.section,
+    )
+
+    if args.seed_closed_state:
+        return _seed_closed_state(args, section_key)
+
+    if not args.confirm_send_email:
+        print(
+            "Refusing to run: poll-once-live can send a real email via SmtpNotifier. "
+            "Re-run with --confirm-send-email to proceed, or use poll-once-dry-run "
+            "for a safe preview that never sends email.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Never let Poller's internal logging (e.g. a notification_failed record, which
+    # includes the raw notifier exception text) reach the console via Python's default
+    # "no handler configured" stderr fallback - this command's own print() statements,
+    # redacted where relevant, are the only sanctioned output.
+    logging.getLogger("unc_notifier").addHandler(logging.NullHandler())
+
+    try:
+        scraper_config = load_scraper_config(args.env_file)
+        smtp_config = load_smtp_config(args.env_file)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    course_key = section_key.course_key
+    scraper = UncClassSearchScraper(contact_email=scraper_config.contact_email)
+    try:
+        snapshots = scraper.fetch_course(course_key)
+    except FetchError as exc:
+        print(f"Fetch failed: {_redact_secrets(str(exc), smtp_config)}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - report cleanly, never a raw traceback
+        message = _redact_secrets(f"{type(exc).__name__}: {exc}", smtp_config)
+        print(f"Fetch failed: {message}", file=sys.stderr)
+        return 1
+
+    snapshot = next((s for s in snapshots if s.section_key == section_key), None)
+    if snapshot is None:
+        print(
+            f"Section {args.section} not found in the response for "
+            f"{course_key.subject} {course_key.catalog_number} ({course_key.term}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Fetched seat state: {_format_snapshot(snapshot)}")
+
+    conn = connect(args.db_path)
+    repository = Repository(conn)
+    repository.ensure_schema()
+
+    prior_state = repository.get_section_state(section_key)
+    print(f"Previous stored state: {_format_state(prior_state)}")
+
+    # Same rule Poller.apply_snapshot() applies internally: a row holding only failure
+    # bookkeeping (never a successful observation) is "no prior state," not history.
+    prev_for_diff = (
+        prior_state if (prior_state is not None and prior_state.last_seen_at) else None
+    )
+    was_available = prev_for_diff.is_available if prev_for_diff is not None else None
+    print(f"Detected transition: {_format_transition(was_available, snapshot.is_available)}")
+
+    watch_entry = WatchEntry(
+        term=args.term, subject=args.subject, catalog_number=args.catalog_number,
+        section=args.section,
+    )
+    notifier = SmtpNotifier(smtp_config)
+    poller = Poller(scraper, repository, notifier, _single_section_poller_config())
+    summary = PollSummary()
+
+    result = poller.apply_snapshot(
+        snapshot, watch_entry, prior_state, summary, now=datetime.now(UTC)
+    )
+
+    print(
+        f"Notification decision: reason={result.decision.reason} "
+        f"level={result.decision.notify_level or '-'}"
+    )
+    print(f"Email attempted: {result.decision.should_attempt_notify}")
+    print(f"Email succeeded: {result.notified}")
+    if result.decision.should_attempt_notify and not result.notified:
+        print(
+            "SMTP delivery failed - the fetched seat state was still persisted; the "
+            "notification remains pending and will be retried on a later poll.",
+            file=sys.stderr,
+        )
+    print(f"Final stored state: {_format_state(result.final_state)}")
+    return 0
+
+
+def _seed_closed_state(args: argparse.Namespace, section_key: SectionKey) -> int:
+    """Test-only setup for poll-once-live: writes a synthetic closed prior state for
+    exactly the requested section, so a later live run can demonstrate a real
+    closed-to-open email transition. Makes no network call, and never touches
+    course_fetch_health or the observations table - this is explicitly not a real
+    observation."""
+    if not args.confirm_seed:
+        print(
+            "Refusing to seed: pass --confirm-seed to write synthetic closed state "
+            "into the database.",
+            file=sys.stderr,
+        )
+        return 1
+
+    now = datetime.now(UTC)
+    seeded_state = SectionState(
+        section_key=section_key,
+        seats_available=0,
+        seats_capacity=1,
+        waitlist_available=None,
+        waitlist_capacity=None,
+        status="closed",
+        last_seen_at=now,
+        last_notified_at=None,
+        consecutive_failures=0,
+        last_attempt_at=now,
+        pending_notification_since=None,
+        last_notification_attempt_at=None,
+    )
+
+    conn = connect(args.db_path)
+    repository = Repository(conn)
+    repository.ensure_schema()
+    repository.save_state(seeded_state)
+
+    print(
+        f"Seeded synthetic closed state for {section_key.subject} "
+        f"{section_key.catalog_number}-{section_key.section} ({section_key.term}) - "
+        "no network call was made:"
+    )
+    print(f"  {_format_state(seeded_state)}")
+    return 0
+
+
+def _single_section_poller_config() -> PollerConfig:
+    """Shared by poll-once-live and (if it ever needs a real PollerConfig object
+    instead of calling diff.evaluate() directly) poll-once-dry-run.
+    circuit_breaker_threshold/backoff_* are unused by Poller.apply_snapshot() itself -
+    they only matter to Poller._poll_course(), which neither command calls - so their
+    exact values here are inert placeholders, not a real policy."""
+    return PollerConfig(
+        cooldown=_SINGLE_SECTION_COOLDOWN,
+        default_waitlist_policy=_SINGLE_SECTION_WAITLIST_POLICY,
+        circuit_breaker_threshold=5,
+        backoff_base_seconds=60,
+        backoff_max_seconds=3600,
+        notification_retry_delay=_SINGLE_SECTION_RETRY_DELAY,
+    )
 
 
 def _minutes(value: int) -> timedelta:
@@ -411,6 +589,57 @@ def build_parser() -> argparse.ArgumentParser:
         "--env-file", default=None, help="Path to .env (default: .env in the current directory)"
     )
     test_email_parser.set_defaults(func=_run_test_email)
+
+    live_parser = subparsers.add_parser(
+        "poll-once-live",
+        help=(
+            "Run the real end-to-end poll for one section: real scraper, real "
+            "Repository, real SmtpNotifier. Requires --db-path and "
+            "--confirm-send-email (or --seed-closed-state --confirm-seed for "
+            "network-free test setup). Never uses the production database or "
+            "watches.yaml."
+        ),
+    )
+    live_parser.add_argument(
+        "--env-file", default=None, help="Path to .env (default: .env in the current directory)"
+    )
+    live_parser.add_argument("--term", required=True, help='e.g. "2026 Fall"')
+    live_parser.add_argument("--subject", required=True, help='e.g. "COMP"')
+    live_parser.add_argument(
+        "--catalog-number", dest="catalog_number", required=True, help='e.g. "210"'
+    )
+    live_parser.add_argument("--section", required=True, help='e.g. "001"')
+    live_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        required=True,
+        help=(
+            "Required - refuses to run without this. Never falls back to the "
+            "production database path."
+        ),
+    )
+    live_parser.add_argument(
+        "--confirm-send-email",
+        action="store_true",
+        help=(
+            "Required to actually run the live poll (it can send a real email via "
+            "SmtpNotifier). Without it, the command refuses to run."
+        ),
+    )
+    live_parser.add_argument(
+        "--seed-closed-state",
+        action="store_true",
+        help=(
+            "Test-only: instead of polling, write a synthetic closed prior state "
+            "for this section into --db-path, then exit. Makes no network call."
+        ),
+    )
+    live_parser.add_argument(
+        "--confirm-seed",
+        action="store_true",
+        help="Required alongside --seed-closed-state to actually write the seeded state.",
+    )
+    live_parser.set_defaults(func=_run_poll_once_live)
 
     return parser
 

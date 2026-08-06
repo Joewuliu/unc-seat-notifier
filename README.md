@@ -77,3 +77,58 @@ plainly that it's a configuration test, not a real seat alert. Prints
 message (i.e. `smtplib`'s send call returned without raising); on failure it prints a
 clear `SMTP test email failed: ...` message to stderr and exits non-zero.
 `SMTP_USERNAME`/`SMTP_PASSWORD` are never printed, including inside error messages.
+
+### `poll-once-live`
+
+Runs the *real* end-to-end poll for exactly one section: real `UncClassSearchScraper`,
+real `Repository`, real `Poller.apply_snapshot()` (the same notification-resolution
+code path `poll` uses - see PROJECT_STATUS.md), and the real `SmtpNotifier`. This is
+the only diagnostic command that can send a real seat-alert email, so it requires two
+things `poll-once-dry-run` doesn't:
+
+- `--db-path` (required, no default - never touches the production database).
+- `--confirm-send-email` - without it, the command refuses to run at all (it never
+  even fetches or constructs `SmtpNotifier`). Use `poll-once-dry-run` instead if you
+  don't want to risk sending real email.
+
+```
+python -m unc_notifier poll-once-live \
+  --term "2026 Fall" --subject COMP --catalog-number 210 --section 001 \
+  --db-path .tmp/live-test.db --confirm-send-email
+```
+
+Prints, in order: the database path, the fetched seat state, the previous stored
+state, the detected transition, the notification decision, whether email was
+attempted, whether it succeeded, and the final stored state. If SMTP delivery fails,
+the fetched seat state is still persisted and the notification stays pending/retryable
+- exactly like a real poll's failure handling - and the command still exits `0` (the
+poll itself succeeded; the email is retryable on a later run, the same as production).
+`SMTP_USERNAME`/`SMTP_PASSWORD` are never printed.
+
+#### Safe test sequence (no real course transition required)
+
+Since UNC courses rarely close-then-reopen on demand, use `--seed-closed-state` to set
+up a synthetic starting point, then run a real live poll to see a genuine
+closed-to-open email:
+
+```
+# 1. Seed a synthetic "closed" prior state - no network call, no email:
+python -m unc_notifier poll-once-live \
+  --term "2026 Fall" --subject COMP --catalog-number 210 --section 001 \
+  --db-path .tmp/live-test.db --seed-closed-state --confirm-seed
+
+# 2. Run the real live poll against the same --db-path. If the section is actually
+#    open right now, this sends one real email (closed -> open transition):
+python -m unc_notifier poll-once-live \
+  --term "2026 Fall" --subject COMP --catalog-number 210 --section 001 \
+  --db-path .tmp/live-test.db --confirm-send-email
+
+# 3. Run it again - same state, no duplicate email:
+python -m unc_notifier poll-once-live \
+  --term "2026 Fall" --subject COMP --catalog-number 210 --section 001 \
+  --db-path .tmp/live-test.db --confirm-send-email
+```
+
+`--seed-closed-state` writes only to `--db-path`, makes no network call, and never
+touches `course_fetch_health` or the observations table (it's explicitly synthetic
+test data, not a real observation). Delete `.tmp/live-test.db` to start over.

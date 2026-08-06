@@ -597,3 +597,328 @@ def test_test_email_does_not_read_watches_yaml(tmp_path, monkeypatch):
     exit_code = main(["test-email", "--env-file", str(env_path)])
 
     assert exit_code == 0
+
+
+# --- poll-once-live --------------------------------------------------------------------
+
+
+def write_live_env(tmp_path, *, extra: str = "") -> Path:
+    """CONTACT_EMAIL + SMTP_* - everything poll-once-live needs, nothing else."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("CONTACT_EMAIL=me@example.com\n" + SMTP_ONLY_ENV + extra)
+    return env_path
+
+
+def _live_args(
+    env_path,
+    db_path,
+    *,
+    confirm_send_email: bool = False,
+    seed: bool = False,
+    confirm_seed: bool = False,
+) -> list[str]:
+    args = [
+        "poll-once-live",
+        "--env-file", str(env_path),
+        "--term", "2026 Fall",
+        "--subject", "COMP",
+        "--catalog-number", "210",
+        "--section", "001",
+        "--db-path", str(db_path),
+    ]
+    if confirm_send_email:
+        args.append("--confirm-send-email")
+    if seed:
+        args.append("--seed-closed-state")
+    if confirm_seed:
+        args.append("--confirm-seed")
+    return args
+
+
+def test_poll_once_live_requires_db_path(tmp_path):
+    env_path = write_live_env(tmp_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "poll-once-live",
+                "--env-file", str(env_path),
+                "--term", "2026 Fall",
+                "--subject", "COMP",
+                "--catalog-number", "210",
+                "--section", "001",
+                "--confirm-send-email",
+            ]
+        )
+
+    assert exc_info.value.code != 0
+
+
+def test_poll_once_live_missing_confirmation_prevents_construction(
+    tmp_path, capsys, monkeypatch
+):
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("must not be called without --confirm-send-email")
+
+    monkeypatch.setattr("unc_notifier.cli.UncClassSearchScraper", _must_not_be_called)
+    monkeypatch.setattr("unc_notifier.cli.SmtpNotifier", _must_not_be_called)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    exit_code = main(_live_args(env_path, db_path, confirm_send_email=False))
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "Database:" in captured.out
+    assert "Refusing to run" in captured.err
+    assert "--confirm-send-email" in captured.err
+
+
+def test_poll_once_live_uses_the_supplied_db_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper([[dry_run_snapshot(3, observed_at=dry_run_time(12))]]),
+    )
+    _mock_smtp(monkeypatch)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "custom" / "live.db"
+    default_looking_path = tmp_path / "data" / "unc_notifier.db"
+
+    exit_code = main(_live_args(env_path, db_path, confirm_send_email=True))
+
+    assert exit_code == 0
+    assert db_path.exists()
+    assert not default_looking_path.exists()
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state is not None
+    assert state.seats_available == 3
+
+
+def test_poll_once_live_first_observation_sends_no_email(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper([[dry_run_snapshot(3, observed_at=dry_run_time(12))]]),
+    )
+    client = _mock_smtp(monkeypatch)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    exit_code = main(_live_args(env_path, db_path, confirm_send_email=True))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "reason=first_observation" in out
+    assert "Email attempted: False" in out
+    assert "Email succeeded: False" in out
+    client.send_message.assert_not_called()
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state.last_notified_at is None
+
+
+def test_poll_once_live_seed_requires_confirm_seed(tmp_path, capsys, monkeypatch):
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("must not be called without --confirm-seed")
+
+    monkeypatch.setattr("unc_notifier.cli.UncClassSearchScraper", _must_not_be_called)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    exit_code = main(_live_args(env_path, db_path, seed=True, confirm_seed=False))
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Refusing to seed" in err
+    assert not db_path.exists()
+
+
+def test_poll_once_live_seed_makes_no_network_call(tmp_path, capsys, monkeypatch):
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("seeding must never touch the network")
+
+    monkeypatch.setattr("unc_notifier.cli.UncClassSearchScraper", _must_not_be_called)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    exit_code = main(_live_args(env_path, db_path, seed=True, confirm_seed=True))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "no network call was made" in out
+    assert "status=closed" in out
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state is not None
+    assert state.status == "closed"
+    assert state.seats_available == 0
+
+
+def test_poll_once_live_seeded_closed_state_then_open_sends_exactly_one_email(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper([[dry_run_snapshot(5, observed_at=dry_run_time(13))]]),
+    )
+    client = _mock_smtp(monkeypatch)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    seed_exit = main(_live_args(env_path, db_path, seed=True, confirm_seed=True))
+    assert seed_exit == 0
+    seed_out = capsys.readouterr().out
+    assert "Seeded synthetic closed state" in seed_out
+
+    live_exit = main(_live_args(env_path, db_path, confirm_send_email=True))
+
+    assert live_exit == 0
+    out = capsys.readouterr().out
+    assert "Detected transition: unavailable -> available" in out
+    assert "Email attempted: True" in out
+    assert "Email succeeded: True" in out
+
+    client.send_message.assert_called_once()
+    sent = client.send_message.call_args[0][0]
+    assert "Seat open: COMP 210-001" in sent["Subject"]
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state.last_notified_at is not None
+
+
+def test_poll_once_live_repeated_unchanged_run_sends_no_duplicate(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper(
+            [
+                [dry_run_snapshot(0, observed_at=dry_run_time(12))],
+                [dry_run_snapshot(5, observed_at=dry_run_time(13))],
+                [dry_run_snapshot(5, observed_at=dry_run_time(14))],
+            ]
+        ),
+    )
+    client = _mock_smtp(monkeypatch)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    main(_live_args(env_path, db_path, confirm_send_email=True))  # run 1: first obs, closed
+    main(_live_args(env_path, db_path, confirm_send_email=True))  # run 2: opens, notifies
+    capsys.readouterr()
+
+    exit_code = main(_live_args(env_path, db_path, confirm_send_email=True))  # run 3: unchanged
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Detected transition: no change (available)" in out
+    assert "Email attempted: False" in out
+    client.send_message.assert_called_once()  # still just the run-2 send
+
+
+def test_poll_once_live_smtp_failure_remains_retryable(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper(
+            [
+                [dry_run_snapshot(0, observed_at=dry_run_time(12))],
+                [dry_run_snapshot(5, observed_at=dry_run_time(13))],
+            ]
+        ),
+    )
+    client = _mock_smtp(monkeypatch)
+    client.send_message.side_effect = smtplib.SMTPException("relay refused")
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    main(_live_args(env_path, db_path, confirm_send_email=True))  # run 1: first observation
+    capsys.readouterr()
+
+    # run 2: opens, SMTP fails
+    exit_code = main(_live_args(env_path, db_path, confirm_send_email=True))
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Email attempted: True" in captured.out
+    assert "Email succeeded: False" in captured.out
+    assert "SMTP delivery failed" in captured.err
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state.seats_available == 5  # observed seat state still persisted
+    assert state.last_notified_at is None  # never confirmed sent
+    assert state.pending_notification_since is not None  # retryable
+    assert state.last_notification_attempt_at is not None
+
+
+def test_poll_once_live_scraper_failure_does_not_corrupt_prior_state(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper(
+            [
+                [dry_run_snapshot(3, observed_at=dry_run_time(12))],
+                FetchError("simulated outage"),
+            ]
+        ),
+    )
+    _mock_smtp(monkeypatch)
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    main(_live_args(env_path, db_path, confirm_send_email=True))  # run 1: succeeds
+    capsys.readouterr()
+
+    exit_code = main(_live_args(env_path, db_path, confirm_send_email=True))  # run 2: fetch fails
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Fetch failed" in err
+    assert "simulated outage" in err
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state is not None
+    assert state.seats_available == 3  # unchanged from run 1
+
+
+def test_poll_once_live_never_prints_smtp_password_on_failure(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper(
+            [
+                [dry_run_snapshot(0, observed_at=dry_run_time(12))],
+                [dry_run_snapshot(5, observed_at=dry_run_time(13))],
+            ]
+        ),
+    )
+    client = _mock_smtp(monkeypatch)
+    client.send_message.side_effect = smtplib.SMTPAuthenticationError(
+        535, b"auth failed for password super-secret-password"
+    )
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    main(_live_args(env_path, db_path, confirm_send_email=True))
+    captured1 = capsys.readouterr()
+    main(_live_args(env_path, db_path, confirm_send_email=True))
+    captured2 = capsys.readouterr()
+
+    for captured in (captured1, captured2):
+        assert "super-secret-password" not in captured.out
+        assert "super-secret-password" not in captured.err
+    assert "smtpuser" not in captured2.out
+    assert "smtpuser" not in captured2.err
+
+
+def test_poll_once_live_redacts_password_from_fetch_error_output(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper([FetchError("auth using super-secret-password failed")]),
+    )
+    env_path = write_live_env(tmp_path)
+    db_path = tmp_path / "live.db"
+
+    exit_code = main(_live_args(env_path, db_path, confirm_send_email=True))
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "super-secret-password" not in err
+    assert "REDACTED" in err

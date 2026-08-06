@@ -51,6 +51,18 @@ class PollSummary:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class SectionPollResult:
+    """What apply_snapshot() decided and did for one section - the same information it
+    already computes internally, just returned instead of discarded. Lets diagnostic
+    callers (poll-once-live, poll-once-dry-run) reuse the real notification-resolution
+    logic instead of re-implementing it."""
+
+    decision: Decision
+    final_state: SectionState
+    notified: bool  # True only on confirmed notifier success, never merely "attempted"
+
+
 class Poller:
     def __init__(
         self,
@@ -153,11 +165,11 @@ class Poller:
 
         for section_key, watch_entry in target_entries.items():
             snapshot = snapshots_by_section[section_key]
-            self._apply_snapshot(
+            self.apply_snapshot(
                 snapshot, watch_entry, known_states.get(section_key), summary, now=now
             )
 
-    def _apply_snapshot(
+    def apply_snapshot(
         self,
         snapshot: SeatSnapshot,
         watch_entry: WatchEntry,
@@ -165,7 +177,15 @@ class Poller:
         summary: PollSummary,
         *,
         now: datetime,
-    ) -> None:
+    ) -> SectionPollResult:
+        """Diff, notify-if-warranted, and persist one already-fetched section snapshot.
+
+        This is the one place notification-resolution logic lives - shared by the real
+        poll cycle (via _poll_course) and any diagnostic command that has already
+        fetched a snapshot and prior state itself (poll-once-live, poll-once-dry-run)
+        and wants the exact same decision/persistence/notify-success guarantees without
+        re-implementing them.
+        """
         policy = watch_entry.waitlist_policy or self._config.default_waitlist_policy
         prev = prior_state if (prior_state is not None and prior_state.last_seen_at) else None
 
@@ -180,8 +200,9 @@ class Poller:
         # Persisted regardless of what happens below: seat data and observation history
         # must never depend on whether a notification attempt is made or succeeds.
         final_state = decision.new_state
+        notified = False
         if decision.should_attempt_notify:
-            final_state = self._attempt_notify(snapshot, decision, summary, now=now)
+            final_state, notified = self._attempt_notify(snapshot, decision, summary, now=now)
 
         self._repository.save_state(final_state)
         self._repository.record_observation(snapshot)
@@ -196,9 +217,11 @@ class Poller:
             decision.should_attempt_notify,
         )
 
+        return SectionPollResult(decision=decision, final_state=final_state, notified=notified)
+
     def _attempt_notify(
         self, snapshot: SeatSnapshot, decision: Decision, summary: PollSummary, *, now: datetime
-    ) -> SectionState:
+    ) -> tuple[SectionState, bool]:
         """Try to deliver the notification for a should_attempt_notify decision.
 
         ``now`` - the poller's own clock, passed in by the caller so tests stay
@@ -208,13 +231,13 @@ class Poller:
         notification attempt actually happens. diff.evaluate() never sets this field for
         exactly that reason - only an actual attempt, made here, may.
 
-        Returns the state to persist: on success, last_notified_at advances to ``now``
-        and pending_notification_since clears, but last_notification_attempt_at is kept
-        (not cleared) as a record of the real attempt time. On failure,
-        decision.new_state is returned with only last_notification_attempt_at
-        overwritten to ``now`` - everything else it already carries (in particular
-        pending_notification_since and the unchanged last_notified_at) is correct for a
-        later retry.
+        Returns (state to persist, whether delivery succeeded). On success,
+        last_notified_at advances to ``now`` and pending_notification_since clears, but
+        last_notification_attempt_at is kept (not cleared) as a record of the real
+        attempt time. On failure, decision.new_state is returned with only
+        last_notification_attempt_at overwritten to ``now`` - everything else it
+        already carries (in particular pending_notification_since and the unchanged
+        last_notified_at) is correct for a later retry.
         """
         event = NotificationEvent(
             section_key=snapshot.section_key,
@@ -241,11 +264,14 @@ class Poller:
                 exc,
                 exc_info=True,
             )
-            return attempted_state
+            return attempted_state, False
 
         summary.sections_notified += 1
         logger.info("notified section=%s reason=%s", snapshot.section_key, decision.reason)
-        return replace(attempted_state, last_notified_at=now, pending_notification_since=None)
+        final_state = replace(
+            attempted_state, last_notified_at=now, pending_notification_since=None
+        )
+        return final_state, True
 
 
 @dataclass

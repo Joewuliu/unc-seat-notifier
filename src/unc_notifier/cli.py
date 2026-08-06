@@ -8,6 +8,11 @@ concurrent installs don't all hit UNC's server in lockstep.
 `python -m unc_notifier scrape-once` is a read-only smoke test for the real scraper:
 fetches and prints one course's sections, never touches SmtpNotifier, Repository, or
 the production database.
+
+`python -m unc_notifier poll-once-dry-run` exercises the real scraper, the real pure
+state machine (diff.evaluate), and a real Repository together for one section - but
+only against an explicitly supplied --db-path, and prints notifications to the console
+instead of sending email via SmtpNotifier.
 """
 
 from __future__ import annotations
@@ -17,16 +22,33 @@ import logging
 import random
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from unc_notifier import diff
 from unc_notifier.config import ConfigError, load_config, load_scraper_config, load_watches
 from unc_notifier.logging_setup import configure_logging
-from unc_notifier.models import CourseKey, SeatSnapshot
+from unc_notifier.models import (
+    CourseKey,
+    Decision,
+    NotificationEvent,
+    SeatSnapshot,
+    SectionKey,
+    SectionState,
+    WaitlistPolicy,
+)
+from unc_notifier.notifier.console import ConsoleNotifier
 from unc_notifier.notifier.smtp import SmtpNotifier
 from unc_notifier.poller import Poller, PollerConfig
 from unc_notifier.scraper.base import FetchError
 from unc_notifier.scraper.unc import UncClassSearchScraper
 from unc_notifier.state.repository import Repository, connect
+
+# Fixed defaults for poll-once-dry-run, which has no PollerConfig of its own - this is
+# a single-section diagnostic tool, not a configurable production pipeline.
+_DRY_RUN_COOLDOWN = timedelta(minutes=30)
+_DRY_RUN_RETRY_DELAY = timedelta(minutes=5)
+_DRY_RUN_WAITLIST_POLICY = WaitlistPolicy.ALERT
 
 logger = logging.getLogger("unc_notifier.cli")
 
@@ -137,6 +159,134 @@ def _format_snapshot(snapshot: SeatSnapshot) -> str:
     )
 
 
+def _run_poll_once_dry_run(args: argparse.Namespace) -> int:
+    """Exercises the real scraper, the real pure state machine (diff.evaluate), and a
+    real Repository together for exactly one section, printing every step.
+
+    Never imports or constructs SmtpNotifier - ConsoleNotifier prints instead of
+    sending. Never opens any database other than the one explicitly passed via
+    --db-path (argparse makes that flag required, so there is no default to fall back
+    to). Safe to run repeatedly: each run just diffs against whatever this exact
+    --db-path already has stored, the same guarantee the real poll command relies on.
+    """
+    try:
+        config = load_scraper_config(args.env_file)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    section_key = SectionKey(
+        term=args.term, subject=args.subject, catalog_number=args.catalog_number,
+        section=args.section,
+    )
+    course_key = section_key.course_key
+
+    scraper = UncClassSearchScraper(contact_email=config.contact_email)
+    try:
+        snapshots = scraper.fetch_course(course_key)
+    except FetchError as exc:
+        print(f"Fetch failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - report cleanly, never a raw traceback
+        print(f"Fetch failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    snapshot = next((s for s in snapshots if s.section_key == section_key), None)
+    if snapshot is None:
+        print(
+            f"Section {args.section} not found in the response for "
+            f"{course_key.subject} {course_key.catalog_number} ({course_key.term}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Fetched seat state: {_format_snapshot(snapshot)}")
+
+    conn = connect(args.db_path)
+    repository = Repository(conn)
+    repository.ensure_schema()
+
+    prior_state = repository.get_section_state(section_key)
+    print(f"Previous stored state: {_format_state(prior_state)}")
+
+    # Same rule the real poller uses: a row holding only failure bookkeeping (never a
+    # successful observation) must be treated as "no prior state," not real history.
+    prev_for_diff = (
+        prior_state if (prior_state is not None and prior_state.last_seen_at) else None
+    )
+    was_available = prev_for_diff.is_available if prev_for_diff is not None else None
+    print(f"Detected transition: {_format_transition(was_available, snapshot.is_available)}")
+
+    decision = diff.evaluate(
+        prev_for_diff,
+        snapshot,
+        waitlist_policy=_DRY_RUN_WAITLIST_POLICY,
+        cooldown=_DRY_RUN_COOLDOWN,
+        retry_delay=_DRY_RUN_RETRY_DELAY,
+    )
+    print(f"Notification decision: reason={decision.reason} level={decision.notify_level or '-'}")
+    print(f"Would notify: {decision.should_attempt_notify}")
+
+    final_state = decision.new_state
+    if decision.should_attempt_notify:
+        final_state = _attempt_console_notify(snapshot, decision, now=datetime.now(UTC))
+
+    repository.save_state(final_state)
+    repository.record_observation(snapshot)
+
+    print(f"Final stored state: {_format_state(final_state)}")
+    return 0
+
+
+def _attempt_console_notify(
+    snapshot: SeatSnapshot, decision: Decision, *, now: datetime
+) -> SectionState:
+    """Mirrors Poller._attempt_notify's success/failure state resolution exactly, using
+    ConsoleNotifier in place of the real notifier. Kept separate from Poller itself so
+    this dry-run tool never risks touching the production poll pipeline's code path."""
+    event = NotificationEvent(
+        section_key=snapshot.section_key,
+        seats_available=snapshot.seats_available,
+        seats_capacity=snapshot.seats_capacity,
+        waitlist_available=snapshot.waitlist_available,
+        waitlist_capacity=snapshot.waitlist_capacity,
+        status=snapshot.status,
+        reason=decision.reason,
+        level=decision.notify_level or diff.LEVEL_INFO,
+        occurred_at=snapshot.observed_at,
+    )
+    try:
+        ConsoleNotifier().notify(event)
+    except Exception as exc:  # noqa: BLE001 - never let a notify failure crash the tool
+        print(f"Notification failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return replace(decision.new_state, last_notification_attempt_at=now)
+
+    return replace(
+        decision.new_state,
+        last_notified_at=now,
+        pending_notification_since=None,
+        last_notification_attempt_at=now,
+    )
+
+
+def _format_state(state: SectionState | None) -> str:
+    if state is None:
+        return "none (never observed)"
+    return (
+        f"seats={state.seats_available}/{state.seats_capacity} status={state.status} "
+        f"last_notified_at={state.last_notified_at} "
+        f"pending_notification_since={state.pending_notification_since}"
+    )
+
+
+def _format_transition(was_available: bool | None, is_available: bool) -> str:
+    if was_available is None:
+        return f"first observation (now {'available' if is_available else 'unavailable'})"
+    if was_available == is_available:
+        return f"no change ({'available' if is_available else 'unavailable'})"
+    return "unavailable -> available" if is_available else "available -> unavailable"
+
+
 def _minutes(value: int) -> timedelta:
     return timedelta(minutes=value)
 
@@ -170,6 +320,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog-number", dest="catalog_number", required=True, help='e.g. "210"'
     )
     scrape_once_parser.set_defaults(func=_run_scrape_once)
+
+    dry_run_parser = subparsers.add_parser(
+        "poll-once-dry-run",
+        help=(
+            "Exercise the real scraper, state machine, and repository for one "
+            "section, printing every step. Never sends email; writes only to the "
+            "explicitly supplied --db-path."
+        ),
+    )
+    dry_run_parser.add_argument(
+        "--env-file", default=None, help="Path to .env (default: .env in the current directory)"
+    )
+    dry_run_parser.add_argument("--term", required=True, help='e.g. "2026 Fall"')
+    dry_run_parser.add_argument("--subject", required=True, help='e.g. "COMP"')
+    dry_run_parser.add_argument(
+        "--catalog-number", dest="catalog_number", required=True, help='e.g. "210"'
+    )
+    dry_run_parser.add_argument("--section", required=True, help='e.g. "001"')
+    dry_run_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        required=True,
+        help=(
+            "Required - refuses to run without this. Never falls back to the "
+            "production database path."
+        ),
+    )
+    dry_run_parser.set_defaults(func=_run_poll_once_dry_run)
 
     return parser
 

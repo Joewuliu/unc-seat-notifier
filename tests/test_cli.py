@@ -8,9 +8,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from unc_notifier.cli import main
 from unc_notifier.models import SeatSnapshot, SectionKey
 from unc_notifier.scraper.base import FetchError
+from unc_notifier.state.repository import Repository, connect
 
 MINIMAL_ENV = """
 CONTACT_EMAIL=me@example.com
@@ -233,3 +236,229 @@ def test_scrape_once_never_constructs_repository_or_notifier(tmp_path, capsys, m
     exit_code = main(_scrape_once_args(env_path))
 
     assert exit_code == 0
+
+
+# --- poll-once-dry-run -------------------------------------------------------------
+
+DRY_RUN_SECTION = SectionKey("2026 Fall", "COMP", "210", "001")
+
+
+def _dry_run_args(env_path, db_path) -> list[str]:
+    return [
+        "poll-once-dry-run",
+        "--env-file", str(env_path),
+        "--term", "2026 Fall",
+        "--subject", "COMP",
+        "--catalog-number", "210",
+        "--section", "001",
+        "--db-path", str(db_path),
+    ]
+
+
+def dry_run_snapshot(seats_available: int, *, observed_at: datetime) -> SeatSnapshot:
+    return SeatSnapshot(
+        section_key=DRY_RUN_SECTION,
+        seats_available=seats_available,
+        seats_capacity=150,
+        waitlist_available=None,
+        waitlist_capacity=None,
+        status="open" if seats_available > 0 else "closed",
+        observed_at=observed_at,
+    )
+
+
+def dry_run_time(hour: int) -> datetime:
+    return datetime(2026, 1, 15, hour, 0, tzinfo=UTC)
+
+
+def make_scripted_scraper(responses):
+    """Returns a class standing in for UncClassSearchScraper whose fetch_course()
+    yields the next scripted response (a list[SeatSnapshot], or an Exception instance
+    to raise) on each call - across however many separate `main([...])` invocations
+    use it, since poll-once-dry-run constructs a fresh scraper instance every run.
+    Never touches the network."""
+    queue = list(responses)
+
+    class _ScriptedScraper:
+        def __init__(self, *, contact_email: str) -> None:
+            self.contact_email = contact_email
+
+        def fetch_course(self, course_key):
+            response = queue.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    return _ScriptedScraper
+
+
+def test_poll_once_dry_run_never_constructs_smtp_notifier(tmp_path, monkeypatch):
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("must not be called by poll-once-dry-run")
+
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper([[dry_run_snapshot(0, observed_at=dry_run_time(12))]]),
+    )
+    monkeypatch.setattr("unc_notifier.cli.SmtpNotifier", _must_not_be_called)
+    env_path = write_env(tmp_path)
+    db_path = tmp_path / "dry-run.db"
+
+    exit_code = main(_dry_run_args(env_path, db_path))
+
+    assert exit_code == 0
+
+
+def test_poll_once_dry_run_requires_db_path(tmp_path):
+    env_path = write_env(tmp_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "poll-once-dry-run",
+                "--env-file", str(env_path),
+                "--term", "2026 Fall",
+                "--subject", "COMP",
+                "--catalog-number", "210",
+                "--section", "001",
+            ]
+        )
+
+    assert exc_info.value.code != 0
+
+
+def test_poll_once_dry_run_uses_the_supplied_db_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper([[dry_run_snapshot(3, observed_at=dry_run_time(12))]]),
+    )
+    env_path = write_env(tmp_path)
+    db_path = tmp_path / "custom" / "dry-run.db"
+    default_looking_path = tmp_path / "data" / "unc_notifier.db"
+
+    exit_code = main(_dry_run_args(env_path, db_path))
+
+    assert exit_code == 0
+    assert db_path.exists()
+    assert not default_looking_path.exists()
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state is not None
+    assert state.seats_available == 3
+
+
+def test_poll_once_dry_run_persists_first_observation_without_notifying(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper([[dry_run_snapshot(3, observed_at=dry_run_time(12))]]),
+    )
+    env_path = write_env(tmp_path)
+    db_path = tmp_path / "dry-run.db"
+
+    exit_code = main(_dry_run_args(env_path, db_path))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Previous stored state: none" in out
+    assert "Detected transition: first observation" in out
+    assert "reason=first_observation" in out
+    assert "Would notify: False" in out
+    assert "[notification]" not in out
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state is not None
+    assert state.seats_available == 3
+    assert state.last_notified_at is None
+
+
+def test_poll_once_dry_run_closed_to_open_transition_notifies_via_console(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper(
+            [
+                [dry_run_snapshot(0, observed_at=dry_run_time(12))],
+                [dry_run_snapshot(5, observed_at=dry_run_time(13))],
+            ]
+        ),
+    )
+    env_path = write_env(tmp_path)
+    db_path = tmp_path / "dry-run.db"
+
+    main(_dry_run_args(env_path, db_path))  # run 1: closed, first observation
+    capsys.readouterr()  # discard run 1's output
+
+    exit_code = main(_dry_run_args(env_path, db_path))  # run 2: closed -> open
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Detected transition: unavailable -> available" in out
+    assert "reason=transition_available" in out
+    assert "Would notify: True" in out
+    assert "[notification] COMP 210-001" in out
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state.last_notified_at is not None
+
+
+def test_poll_once_dry_run_repeated_unchanged_observation_does_not_duplicate_alert(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper(
+            [
+                [dry_run_snapshot(0, observed_at=dry_run_time(12))],
+                [dry_run_snapshot(5, observed_at=dry_run_time(13))],
+                [dry_run_snapshot(5, observed_at=dry_run_time(14))],
+            ]
+        ),
+    )
+    env_path = write_env(tmp_path)
+    db_path = tmp_path / "dry-run.db"
+
+    main(_dry_run_args(env_path, db_path))  # run 1: closed, first observation
+    main(_dry_run_args(env_path, db_path))  # run 2: closed -> open, notifies
+    capsys.readouterr()  # discard runs 1-2 output
+
+    exit_code = main(_dry_run_args(env_path, db_path))  # run 3: still open, unchanged
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Detected transition: no change (available)" in out
+    assert "Would notify: False" in out
+    assert "[notification]" not in out
+
+
+def test_poll_once_dry_run_fetch_error_does_not_corrupt_prior_state(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        "unc_notifier.cli.UncClassSearchScraper",
+        make_scripted_scraper(
+            [
+                [dry_run_snapshot(3, observed_at=dry_run_time(12))],
+                FetchError("simulated outage"),
+            ]
+        ),
+    )
+    env_path = write_env(tmp_path)
+    db_path = tmp_path / "dry-run.db"
+
+    main(_dry_run_args(env_path, db_path))  # run 1: succeeds, persists real state
+    capsys.readouterr()  # discard run 1's output
+
+    exit_code = main(_dry_run_args(env_path, db_path))  # run 2: fetch fails
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Fetch failed" in err
+    assert "simulated outage" in err
+
+    state = Repository(connect(db_path)).get_section_state(DRY_RUN_SECTION)
+    assert state is not None
+    assert state.seats_available == 3  # unchanged from run 1
+    assert state.last_seen_at is not None

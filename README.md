@@ -35,3 +35,26 @@ Exits `0` on success (including a legitimate zero-results course) and non-zero w
 clear message on any fetch or parse failure. Still reads `.env` for `CONTACT_EMAIL`
 (used in the scraper's User-Agent), but never constructs a `Repository`, `SmtpNotifier`,
 or opens the production database.
+
+### `poll-once-dry-run`
+
+Exercises the real scraper, the real state-machine decision logic (`diff.evaluate`),
+and a real `Repository` together for exactly one section - the full pipeline the real
+`poll` command uses, minus SMTP. Notifications print to the console
+(`ConsoleNotifier`) instead of being emailed. `--db-path` is required; there is no
+default, so this can never accidentally read or write the production database.
+
+```
+python -m unc_notifier poll-once-dry-run \
+  --term "2026 Fall" --subject COMP --catalog-number 210 --section 001 \
+  --db-path .tmp/unc-seat-notifier-test.db
+```
+
+Prints, in order: the fetched seat state, the previously stored state (if any), the
+detected transition, the notification decision (reason/level), whether a notification
+would have been sent, and the final stored state. Safe to run repeatedly against the
+same `--db-path` - each run just diffs against whatever that file already has, exactly
+like a real poll cycle would (first run records a baseline with no notification; a
+later run only notifies on a genuine transition into availability, subject to the same
+cooldown/retry rules the real poller uses). Point `--db-path` at a scratch file (or
+delete it) to start over.

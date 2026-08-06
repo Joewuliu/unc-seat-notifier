@@ -40,6 +40,15 @@ class AppConfig:
     notification_retry_delay_minutes: int
 
 
+@dataclass(frozen=True, slots=True)
+class ScraperConfig:
+    """Everything UncClassSearchScraper actually needs - nothing else. Deliberately
+    separate from AppConfig so a scraper-only command (scrape-once) never reads,
+    validates, or requires SMTP/database settings it has no use for."""
+
+    contact_email: str
+
+
 _REQUIRED = ("CONTACT_EMAIL", "SMTP_HOST", "SMTP_PORT", "SMTP_FROM", "SMTP_TO")
 
 
@@ -47,12 +56,31 @@ def _bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _load_env_values(env_path: str | Path | None) -> dict[str, str]:
+    """.env (defaulting to the current directory's .env) merged with the process
+    environment, which takes precedence."""
+    file_values = dotenv_values(env_path) if env_path is not None else dotenv_values()
+    return {**file_values, **os.environ}
+
+
+def load_scraper_config(env_path: str | Path | None = None) -> ScraperConfig:
+    """Read only CONTACT_EMAIL from .env/environment. Used by scrape-once, which must
+    be runnable without any SMTP or database configuration - see load_config() for the
+    full poll-command configuration, which this deliberately does not call."""
+    values = _load_env_values(env_path)
+
+    contact_email = values.get("CONTACT_EMAIL")
+    if not contact_email:
+        raise ConfigError("Missing required .env value: CONTACT_EMAIL")
+
+    return ScraperConfig(contact_email=contact_email)
+
+
 def load_config(env_path: str | Path | None = None) -> AppConfig:
     """Read .env (defaulting to the current directory's .env) plus process environment,
     with process environment taking precedence. Raises ConfigError if anything required
     is missing or malformed."""
-    file_values = dotenv_values(env_path) if env_path is not None else dotenv_values()
-    values = {**file_values, **os.environ}
+    values = _load_env_values(env_path)
 
     missing = [key for key in _REQUIRED if not values.get(key)]
     if missing:

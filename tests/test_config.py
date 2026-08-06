@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from unc_notifier.config import ConfigError, load_config, load_watches
+from unc_notifier.config import ConfigError, load_config, load_scraper_config, load_watches
 from unc_notifier.models import WaitlistPolicy
 
 MINIMAL_ENV = """
@@ -65,6 +65,53 @@ def test_load_config_reads_custom_values(tmp_path):
 
     assert config.cooldown_minutes == 45
     assert config.smtp.use_tls is False
+
+
+def test_load_scraper_config_succeeds_with_only_contact_email(tmp_path):
+    env_path = write_env(tmp_path, "CONTACT_EMAIL=me@example.com\n")
+
+    config = load_scraper_config(env_path)
+
+    assert config.contact_email == "me@example.com"
+
+
+def test_load_scraper_config_missing_contact_email_raises_clear_config_error(tmp_path):
+    env_path = write_env(tmp_path, "SOME_OTHER_VAR=1\n")
+
+    with pytest.raises(ConfigError, match="CONTACT_EMAIL"):
+        load_scraper_config(env_path)
+
+
+def test_load_scraper_config_ignores_missing_smtp_and_database_settings(tmp_path):
+    """An .env with only CONTACT_EMAIL - no SMTP_HOST/PORT/FROM/TO, no DB_PATH - must
+    load successfully. load_config() would reject this same file."""
+    env_path = write_env(tmp_path, "CONTACT_EMAIL=me@example.com\n")
+
+    load_scraper_config(env_path)  # must not raise
+
+    with pytest.raises(ConfigError, match="SMTP_HOST"):
+        load_config(env_path)
+
+
+def test_load_scraper_config_ignores_invalid_smtp_values(tmp_path):
+    """Even present-but-broken SMTP settings must not affect scrape-once - proves the
+    scraper-only path truly never reads/validates them, not just that it tolerates
+    their absence."""
+    env_path = write_env(
+        tmp_path,
+        "CONTACT_EMAIL=me@example.com\n"
+        "SMTP_HOST=smtp.example.com\n"
+        "SMTP_PORT=not-a-number\n"
+        "SMTP_FROM=bot@example.com\n"
+        "SMTP_TO=me@example.com\n",
+    )
+
+    config = load_scraper_config(env_path)  # must not raise despite invalid SMTP_PORT
+
+    assert config.contact_email == "me@example.com"
+
+    with pytest.raises(ConfigError, match="SMTP_PORT"):
+        load_config(env_path)
 
 
 WATCHES_YAML = """

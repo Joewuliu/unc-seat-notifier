@@ -18,3 +18,10 @@ watches:
   - term: "2026 Spring"
     subject: "PHYS"
     catalog_number: "101"
+
+  # Production example used in this project's own manual verification - term,
+  # catalog_number, and section are all strings even though they look numeric.
+  - term: "2026 Fall"
+    subject: "COMP"
+    catalog_number: "210"
+    section: "001"

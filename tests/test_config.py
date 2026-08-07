@@ -73,6 +73,53 @@ def test_load_config_reads_custom_values(tmp_path):
     assert config.smtp.use_tls is False
 
 
+def test_load_config_resolves_relative_paths_against_env_file_directory(tmp_path):
+    """DB_PATH/LOG_PATH/WATCHES_PATH/LOCK_PATH defaults are relative - they must
+    resolve against the .env file's own directory, not the test process's CWD, so a
+    scheduler launching from any working directory still finds the right files."""
+    env_path = write_env(tmp_path, MINIMAL_ENV)
+
+    config = load_config(env_path)
+
+    base = env_path.resolve().parent
+    assert config.db_path == base / "data" / "unc_notifier.db"
+    assert config.log_path == base / "logs" / "unc_notifier.log"
+    assert config.watches_path == base / "watches.yaml"
+    assert config.lock_path == base / "data" / "unc_notifier.lock"
+
+
+def test_load_config_absolute_paths_are_used_as_is(tmp_path):
+    absolute_db = tmp_path / "elsewhere" / "unc.db"
+    env_path = write_env(tmp_path, MINIMAL_ENV + f"\nDB_PATH={absolute_db}\n")
+
+    config = load_config(env_path)
+
+    assert config.db_path == absolute_db
+
+
+def test_load_config_custom_lock_path_is_resolved_relative_to_env_dir(tmp_path):
+    env_path = write_env(tmp_path, MINIMAL_ENV + "\nLOCK_PATH=custom.lock\n")
+
+    config = load_config(env_path)
+
+    assert config.lock_path == env_path.resolve().parent / "custom.lock"
+
+
+def test_load_config_with_no_env_file_falls_back_to_cwd_relative_paths(monkeypatch, tmp_path):
+    """Interactive/dev convenience: with no --env-file at all, relative paths stay
+    CWD-relative, matching dotenv's own default .env discovery behavior."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CONTACT_EMAIL", "me@example.com")
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("SMTP_PORT", "587")
+    monkeypatch.setenv("SMTP_FROM", "bot@example.com")
+    monkeypatch.setenv("SMTP_TO", "me@example.com")
+
+    config = load_config()
+
+    assert config.db_path == tmp_path / "data" / "unc_notifier.db"
+
+
 def test_load_scraper_config_succeeds_with_only_contact_email(tmp_path):
     env_path = write_env(tmp_path, "CONTACT_EMAIL=me@example.com\n")
 

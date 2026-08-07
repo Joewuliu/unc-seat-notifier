@@ -14,7 +14,7 @@ from datetime import datetime
 
 from bs4 import BeautifulSoup, Tag
 
-from unc_notifier.models import SeatSnapshot, SectionKey
+from unc_notifier.models import CourseKey, SeatSnapshot, SectionKey
 from unc_notifier.scraper.base import FetchError
 
 _SEATS_PATTERN = re.compile(r"(\d+)\s*/\s*(\d+)\s+available seats", re.IGNORECASE)
@@ -29,13 +29,27 @@ def extract_csrf_token(html: str) -> str:
     return token_input["value"]
 
 
-def parse_tiled_search(html: str, *, observed_at: datetime) -> list[SeatSnapshot]:
-    """Parse a Tiled Search results page into one SeatSnapshot per section card.
+def parse_tiled_search(
+    html: str, *, observed_at: datetime, course_key: CourseKey
+) -> list[SeatSnapshot]:
+    """Parse a Tiled Search results page into one SeatSnapshot per section card,
+    filtered down to exactly the requested course.
+
+    UNC's real Tiled Search can return cards for related-but-distinct catalog
+    numbers alongside an exact match (e.g. searching catalog_number "231" can also
+    surface "231L") - those unrelated cards are not an error, they're just filtered
+    out. Page-structural validation (the declared "Found N course(s), M section(s))"
+    counts, and each card's own structural parsing) is always checked against
+    *every* card the page actually contains, before filtering - a malformed card or
+    a declared-count mismatch fails the whole fetch even if the malformed/uncounted
+    card belongs to a course we don't care about, since that indicates something is
+    wrong with the page itself, not just with an unrelated result.
 
     ``observed_at`` is supplied by the caller (never read from a clock here) so this
     function stays pure and deterministic for tests. A legitimate "No results found."
-    page returns an empty list - that is a valid, successful result, not an error.
-    Anything that doesn't match the expected structure raises FetchError instead of
+    page, or a valid page containing no card that exactly matches ``course_key``,
+    both return an empty list - a valid, successful result, not an error. Anything
+    that doesn't match the expected page/card structure raises FetchError instead of
     returning partial or best-guess data.
     """
     soup = BeautifulSoup(html, "html.parser")
@@ -70,8 +84,14 @@ def parse_tiled_search(html: str, *, observed_at: datetime) -> list[SeatSnapshot
             f"contains {len(cards)} card(s)"
         )
 
+    # Every card is parsed - and so structurally validated - before any filtering.
+    # A malformed card fails the whole fetch regardless of which course it belongs
+    # to; see the docstring above for why that's deliberate.
     snapshots = [_parse_card(card, observed_at) for card in cards]
 
+    # Checked against the full, unfiltered set of cards the page declared - this is
+    # page-structural integrity, not "did I get what I asked for," so it must never
+    # be evaluated against the course-filtered result below.
     actual_courses = {(s.section_key.subject, s.section_key.catalog_number) for s in snapshots}
     if len(actual_courses) != expected_courses:
         raise FetchError(
@@ -79,7 +99,7 @@ def parse_tiled_search(html: str, *, observed_at: datetime) -> list[SeatSnapshot
             f"contains {len(actual_courses)} distinct course(s)"
         )
 
-    return snapshots
+    return [s for s in snapshots if s.section_key.course_key == course_key]
 
 
 def _parse_card(card: Tag, observed_at: datetime) -> SeatSnapshot:

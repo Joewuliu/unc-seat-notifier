@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from unc_notifier.cli import main
+from unc_notifier.lock import single_instance_lock
 from unc_notifier.models import SeatSnapshot, SectionKey
 from unc_notifier.scraper.base import FetchError
 from unc_notifier.state.repository import Repository, connect
@@ -133,6 +134,167 @@ def test_poll_with_scraper_failure_records_it_without_crashing_the_run(
     assert exit_code == 0
     out = capsys.readouterr().out
     assert "courses_failed=1" in out
+
+
+# --- poll: startup path printing and single-instance lock -------------------------------
+
+
+def test_poll_prints_resolved_non_secret_paths_at_startup_and_never_the_password(
+    tmp_path, capsys
+):
+    env_path, db_path, log_path = write_project(tmp_path, watches_yaml="watches: []\n")
+    with env_path.open("a") as f:
+        f.write("SMTP_PASSWORD=topsecretpass\n")
+
+    main(["poll", "--env-file", str(env_path), "--skip-jitter"])
+
+    out = capsys.readouterr().out
+    assert f"Database: {db_path}" in out
+    assert f"Log file: {log_path}" in out
+    assert "topsecretpass" not in out
+
+
+def test_poll_refuses_to_run_when_another_instance_holds_the_lock(tmp_path, capsys):
+    env_path, db_path, log_path = write_project(tmp_path, watches_yaml="watches: []\n")
+    lock_path = db_path.parent / "unc_notifier.lock"
+
+    with single_instance_lock(lock_path):
+        exit_code = main(["poll", "--env-file", str(env_path), "--skip-jitter"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Another poll is already running" in out
+    assert not db_path.exists()  # never got far enough to open the database
+
+
+def test_poll_releases_the_lock_after_a_successful_run_so_a_later_poll_can_proceed(
+    tmp_path,
+):
+    env_path, _, _ = write_project(tmp_path, watches_yaml="watches: []\n")
+
+    first = main(["poll", "--env-file", str(env_path), "--skip-jitter"])
+    second = main(["poll", "--env-file", str(env_path), "--skip-jitter"])
+
+    assert first == 0
+    assert second == 0
+
+
+def test_poll_releases_the_lock_even_if_the_run_crashes_unexpectedly(tmp_path, monkeypatch):
+    env_path, _, _ = write_project(tmp_path, watches_yaml="watches: []\n")
+
+    def boom(self):
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr("unc_notifier.state.repository.Repository.ensure_schema", boom)
+    with pytest.raises(RuntimeError):
+        main(["poll", "--env-file", str(env_path), "--skip-jitter"])
+    monkeypatch.undo()
+
+    exit_code = main(["poll", "--env-file", str(env_path), "--skip-jitter"])
+
+    assert exit_code == 0
+
+
+# --- production-check --------------------------------------------------------------------
+
+
+def test_production_check_passes_for_a_complete_valid_setup(tmp_path, capsys):
+    env_path, db_path, log_path = write_project(tmp_path, watches_yaml="watches: []\n")
+
+    exit_code = main(["production-check", "--env-file", str(env_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "[PASS] Configuration parses" in out
+    assert "[PASS] Watches file exists" in out
+    assert "[PASS] Watches file parses" in out
+    assert "[PASS] Database directory writable" in out
+    assert "[PASS] Log directory writable" in out
+    assert "[PASS] SMTP settings structurally valid" in out
+    assert "[PASS] Scraper contact email present" in out
+    assert not db_path.exists()
+    assert not log_path.exists()
+
+
+def test_production_check_fails_clearly_on_missing_env_file(tmp_path, capsys):
+    missing_env = tmp_path / "does-not-exist.env"
+
+    exit_code = main(["production-check", "--env-file", str(missing_env)])
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] Configuration parses" in out
+
+
+def test_production_check_fails_on_missing_watches_file(tmp_path, capsys):
+    env_path = tmp_path / ".env"
+    db_path = tmp_path / "data" / "unc_notifier.db"
+    log_path = tmp_path / "logs" / "unc_notifier.log"
+    watches_path = tmp_path / "watches.yaml"  # deliberately never written
+    env_path.write_text(
+        MINIMAL_ENV
+        + f"\nDB_PATH={db_path}\nLOG_PATH={log_path}\nWATCHES_PATH={watches_path}\n"
+    )
+
+    exit_code = main(["production-check", "--env-file", str(env_path)])
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] Watches file exists" in out
+
+
+def test_production_check_fails_when_db_path_parent_is_not_a_directory(tmp_path, capsys):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    db_path = blocker / "unc_notifier.db"
+    log_path = tmp_path / "logs" / "unc_notifier.log"
+    log_path.parent.mkdir(parents=True)
+    watches_path = tmp_path / "watches.yaml"
+    watches_path.write_text("watches: []\n")
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        MINIMAL_ENV
+        + f"\nDB_PATH={db_path}\nLOG_PATH={log_path}\nWATCHES_PATH={watches_path}\n"
+    )
+
+    exit_code = main(["production-check", "--env-file", str(env_path)])
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] Database directory writable" in out
+
+
+def test_production_check_never_scrapes_sends_email_or_touches_the_database(
+    tmp_path, monkeypatch
+):
+    class ExplodingScraper:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("production-check must never construct a scraper")
+
+    class ExplodingNotifier:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("production-check must never construct a notifier")
+
+    monkeypatch.setattr("unc_notifier.cli.UncClassSearchScraper", ExplodingScraper)
+    monkeypatch.setattr("unc_notifier.cli.SmtpNotifier", ExplodingNotifier)
+    env_path, db_path, _ = write_project(tmp_path, watches_yaml="watches: []\n")
+
+    exit_code = main(["production-check", "--env-file", str(env_path)])
+
+    assert exit_code == 0
+    assert not db_path.exists()
+
+
+def test_production_check_never_prints_smtp_credentials(tmp_path, capsys):
+    env_path, _, _ = write_project(tmp_path, watches_yaml="watches: []\n")
+    with env_path.open("a") as f:
+        f.write("SMTP_USERNAME=topsecretuser\nSMTP_PASSWORD=topsecretpass\n")
+
+    main(["production-check", "--env-file", str(env_path)])
+
+    out = capsys.readouterr().out
+    assert "topsecretuser" not in out
+    assert "topsecretpass" not in out
 
 
 # --- scrape-once -----------------------------------------------------------------------

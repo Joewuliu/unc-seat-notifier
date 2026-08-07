@@ -1,0 +1,27 @@
+# `section` is optional: give one to watch just that section, or omit it to watch
+# every section returned for that course (fetched once per distinct course either way).
+# `waitlist_policy` is optional per entry and overrides DEFAULT_WAITLIST_POLICY from
+# .env when a section has people actively on its waitlist. One of: alert, warn, silent.
+watches:
+  - term: "2027 Spring"
+    subject: "COMP"
+    catalog_number: "550"
+    section: "001"
+
+  - term: "2027 Spring"
+    subject: "MATH"
+    catalog_number: "231"
+    section: "001"
+    waitlist_policy: "warn"
+
+  # No `section` -> watches every section of PHYS 101, using DEFAULT_WAITLIST_POLICY.
+  - term: "2027 Spring"
+    subject: "PHYS"
+    catalog_number: "101"
+
+  # Production example used in this project's own manual verification - term,
+  # catalog_number, and section are all strings even though they look numeric.
+  - term: "2026 Fall"
+    subject: "COMP"
+    catalog_number: "210"
+    section: "001"

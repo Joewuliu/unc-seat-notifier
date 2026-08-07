@@ -30,6 +30,7 @@ class AppConfig:
     db_path: Path
     log_path: Path
     watches_path: Path
+    lock_path: Path
     poll_interval_minutes: int
     jitter_seconds: int
     cooldown_minutes: int
@@ -62,6 +63,25 @@ def _load_env_values(env_path: str | Path | None) -> dict[str, str]:
     environment, which takes precedence."""
     file_values = dotenv_values(env_path) if env_path is not None else dotenv_values()
     return {**file_values, **os.environ}
+
+
+def _path_base_dir(env_path: str | Path | None) -> Path:
+    """Where a relative DB_PATH/LOG_PATH/WATCHES_PATH/LOCK_PATH should be resolved
+    against. When --env-file is given explicitly (as the production launcher always
+    does, using an absolute path computed from its own script location), relative
+    paths resolve against that .env file's directory - never the process's current
+    working directory, so a scheduler launching from an arbitrary "start in" folder
+    can't silently point at the wrong files. Falls back to the current working
+    directory only for the interactive/dev case of no --env-file at all, matching
+    dotenv's own default CWD-based .env discovery."""
+    if env_path is None:
+        return Path.cwd()
+    return Path(env_path).resolve().parent
+
+
+def _resolve_configured_path(raw: str, *, base_dir: Path) -> Path:
+    path = Path(raw)
+    return path if path.is_absolute() else base_dir / path
 
 
 def load_scraper_config(env_path: str | Path | None = None) -> ScraperConfig:
@@ -128,6 +148,17 @@ def load_config(env_path: str | Path | None = None) -> AppConfig:
             f"DEFAULT_WAITLIST_POLICY must be one of [{valid}], got {policy_raw!r}"
         ) from exc
 
+    base_dir = _path_base_dir(env_path)
+    db_path = _resolve_configured_path(
+        values.get("DB_PATH", "data/unc_notifier.db"), base_dir=base_dir
+    )
+    default_lock_path = db_path.parent / "unc_notifier.lock"
+    lock_path = (
+        _resolve_configured_path(values["LOCK_PATH"], base_dir=base_dir)
+        if values.get("LOCK_PATH")
+        else default_lock_path
+    )
+
     try:
         return AppConfig(
             contact_email=values["CONTACT_EMAIL"],
@@ -140,9 +171,14 @@ def load_config(env_path: str | Path | None = None) -> AppConfig:
                 from_addr=values["SMTP_FROM"],
                 to_addr=values["SMTP_TO"],
             ),
-            db_path=Path(values.get("DB_PATH", "data/unc_notifier.db")),
-            log_path=Path(values.get("LOG_PATH", "logs/unc_notifier.log")),
-            watches_path=Path(values.get("WATCHES_PATH", "watches.yaml")),
+            db_path=db_path,
+            log_path=_resolve_configured_path(
+                values.get("LOG_PATH", "logs/unc_notifier.log"), base_dir=base_dir
+            ),
+            watches_path=_resolve_configured_path(
+                values.get("WATCHES_PATH", "watches.yaml"), base_dir=base_dir
+            ),
+            lock_path=lock_path,
             poll_interval_minutes=int(values.get("POLL_INTERVAL_MINUTES", "5")),
             jitter_seconds=int(values.get("JITTER_SECONDS", "30")),
             cooldown_minutes=int(values.get("COOLDOWN_MINUTES", "30")),

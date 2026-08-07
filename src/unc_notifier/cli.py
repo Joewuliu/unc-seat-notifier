@@ -32,18 +32,22 @@ import argparse
 import logging
 import random
 import sys
+import tempfile
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from unc_notifier import diff
 from unc_notifier.config import (
+    AppConfig,
     ConfigError,
     load_config,
     load_scraper_config,
     load_smtp_config,
     load_watches,
 )
+from unc_notifier.lock import LockUnavailable, single_instance_lock
 from unc_notifier.logging_setup import configure_logging
 from unc_notifier.models import (
     CourseKey,
@@ -73,6 +77,12 @@ logger = logging.getLogger("unc_notifier.cli")
 
 
 def _run_poll(args: argparse.Namespace) -> int:
+    """The real end-to-end poll cycle - the cron/Task Scheduler entrypoint. Prints and
+    logs the resolved (non-secret) production paths at startup so a run launched from
+    an unfamiliar working directory (as Task Scheduler does) is always traceable, and
+    guards the whole cycle with single_instance_lock() so a second scheduled run that
+    overlaps a still-running one exits immediately instead of racing it."""
+    run_started_at = datetime.now(UTC)
     try:
         config = load_config(args.env_file)
         watches = load_watches(config.watches_path)
@@ -81,7 +91,35 @@ def _run_poll(args: argparse.Namespace) -> int:
         return 1
 
     configure_logging(config.log_path)
+    print(f"Config file: {args.env_file or '(default .env in current directory)'}")
+    print(f"Database: {config.db_path}")
+    print(f"Log file: {config.log_path}")
+    print(f"Watches file: {config.watches_path}")
+    print(f"Lock file: {config.lock_path}")
+    print(f"Watched entries: {len(watches)}")
+    logger.info(
+        "run_start timestamp=%s watched_entries=%d db_path=%s log_path=%s "
+        "watches_path=%s lock_path=%s",
+        run_started_at.isoformat(), len(watches), config.db_path, config.log_path,
+        config.watches_path, config.lock_path,
+    )
 
+    try:
+        with single_instance_lock(config.lock_path):
+            exit_code = _run_poll_locked(args, config, watches)
+    except LockUnavailable as exc:
+        logger.warning("run_skipped_overlap error=%s", exc)
+        print(f"Another poll is already running - exiting cleanly ({exc}).")
+        return 0
+
+    logger.info("run_end exit_status=%d", exit_code)
+    return exit_code
+
+
+def _run_poll_locked(
+    args: argparse.Namespace, config: AppConfig, watches: list[WatchEntry]
+) -> int:
+    """The part of the poll cycle that must only ever run under single_instance_lock()."""
     if not args.skip_jitter and config.jitter_seconds > 0:
         delay = random.uniform(0, config.jitter_seconds)
         logger.info("jitter_sleep seconds=%.1f", delay)
@@ -123,6 +161,103 @@ def _run_poll(args: argparse.Namespace) -> int:
         f"notification_failures={summary.notification_failures}"
     )
     return 0
+
+
+def _run_production_check(args: argparse.Namespace) -> int:
+    """Read-only validation that everything `poll` would need is present and
+    structurally valid, without ever scraping UNC, sending email, or creating or
+    modifying the production database - the only side effect anywhere in this
+    function is a temp-file write-and-delete probe used to confirm a directory is
+    writable, immediately cleaned up."""
+    print(f"Python: {sys.executable} ({sys.version.split()[0]})")
+    print(f"Virtual environment active: {sys.prefix != sys.base_prefix}")
+
+    checks: list[tuple[str, bool, str]] = []
+
+    env_display = args.env_file or "(default .env in current directory)"
+    try:
+        config = load_config(args.env_file)
+    except ConfigError as exc:
+        checks.append(("Configuration parses", False, f"{env_display}: {exc}"))
+        _print_checks(checks)
+        return 1
+    checks.append(("Configuration parses", True, env_display))
+
+    if not config.watches_path.exists():
+        checks.append(("Watches file exists", False, str(config.watches_path)))
+    else:
+        checks.append(("Watches file exists", True, str(config.watches_path)))
+        try:
+            watches = load_watches(config.watches_path)
+        except ConfigError as exc:
+            checks.append(("Watches file parses", False, str(exc)))
+        else:
+            checks.append(("Watches file parses", True, f"{len(watches)} entries"))
+
+    checks.append(("Database directory writable", *_check_dir_writable(config.db_path.parent)))
+    checks.append(("Log directory writable", *_check_dir_writable(config.log_path.parent)))
+    checks.append(("Lock directory writable", *_check_dir_writable(config.lock_path.parent)))
+    checks.append(
+        ("SMTP settings structurally valid", *_check_smtp_structurally_valid(config.smtp))
+    )
+    checks.append(
+        ("Scraper contact email present", bool(config.contact_email), config.contact_email)
+    )
+
+    _print_checks(checks)
+    return 0 if all(passed for _, passed, _ in checks) else 1
+
+
+def _check_dir_writable(directory: Path) -> tuple[bool, str]:
+    """The directory itself doesn't have to exist yet - connect()/configure_logging()/
+    single_instance_lock() all create their target directory lazily on first real
+    run via mkdir(parents=True). What actually matters for readiness is whether the
+    nearest *existing* ancestor can have new entries created inside it; this never
+    creates the target directory itself, only a temp probe file (immediately
+    deleted) in whichever existing ancestor it finds."""
+    probe_target = directory
+    while not probe_target.exists():
+        parent = probe_target.parent
+        if parent == probe_target:
+            return False, f"no existing ancestor directory found for {directory}"
+        probe_target = parent
+
+    if not probe_target.is_dir():
+        return False, f"not a directory: {probe_target}"
+    try:
+        with tempfile.NamedTemporaryFile(dir=probe_target, delete=True):
+            pass
+    except OSError as exc:
+        return False, f"not writable: {exc}"
+
+    if probe_target == directory:
+        return True, str(directory)
+    return True, f"{directory} (will be created on first run; {probe_target} is writable)"
+
+
+def _check_smtp_structurally_valid(smtp: SmtpConfig) -> tuple[bool, str]:
+    """Structural validation only - never opens a socket or connects to the SMTP
+    host. Detail text never includes username/password."""
+    problems = []
+    if not smtp.host:
+        problems.append("SMTP_HOST is empty")
+    if not (1 <= smtp.port <= 65535):
+        problems.append(f"SMTP_PORT {smtp.port} out of range")
+    if "@" not in smtp.from_addr:
+        problems.append("SMTP_FROM does not look like an email address")
+    if "@" not in smtp.to_addr:
+        problems.append("SMTP_TO does not look like an email address")
+    if bool(smtp.username) != bool(smtp.password):
+        problems.append("SMTP_USERNAME and SMTP_PASSWORD must both be set or both omitted")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, f"{smtp.host}:{smtp.port} (TLS={'on' if smtp.use_tls else 'off'})"
+
+
+def _print_checks(checks: list[tuple[str, bool, str]]) -> None:
+    for name, passed, detail in checks:
+        print(f"[{'PASS' if passed else 'FAIL'}] {name}: {detail}")
 
 
 def _run_scrape_once(args: argparse.Namespace) -> int:
@@ -531,6 +666,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-jitter", action="store_true", help="Skip the startup jitter sleep."
     )
     poll_parser.set_defaults(func=_run_poll)
+
+    production_check_parser = subparsers.add_parser(
+        "production-check",
+        help=(
+            "Read-only validation that everything `poll` needs is present and "
+            "structurally valid: files exist, config/watches parse, db/log/lock "
+            "directories are writable, SMTP settings are structurally sane. Never "
+            "scrapes UNC, sends email, or touches the production database."
+        ),
+    )
+    production_check_parser.add_argument(
+        "--env-file", default=None, help="Path to .env (default: .env in the current directory)"
+    )
+    production_check_parser.set_defaults(func=_run_production_check)
 
     scrape_once_parser = subparsers.add_parser(
         "scrape-once",

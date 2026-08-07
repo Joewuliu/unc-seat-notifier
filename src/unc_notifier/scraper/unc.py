@@ -49,7 +49,9 @@ class UncClassSearchScraper(Scraper):
                 "catalog_number": course_key.catalog_number,
             },
         )
-        return parse_tiled_search(response.text, observed_at=datetime.now(UTC))
+        return parse_tiled_search(
+            response.text, observed_at=datetime.now(UTC), course_key=course_key
+        )
 
     def _ensure_primed(self) -> None:
         if self._csrf_token is not None:

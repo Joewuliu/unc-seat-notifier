@@ -15,6 +15,7 @@ exist" paths - never a real registration or removal.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import uuid
@@ -150,6 +151,126 @@ def test_fails_clearly_when_launcher_is_missing(tmp_path):
 
     assert result.returncode == 1
     assert "Launcher not found" in result.stderr
+
+
+# --- repetition duration regression --------------------------------------------------
+#
+# Real production registration once failed with:
+#   Register-ScheduledTask: The task XML contains a value which is incorrectly
+#   formatted or out of range. (8,42):Duration:P99999999DT23H59M59S
+#   HRESULT 0x80041318
+# caused by -RepetitionDuration ([TimeSpan]::MaxValue). Fixed by omitting
+# -RepetitionDuration entirely (Task Scheduler's documented way to repeat
+# indefinitely), with an opt-in -RepetitionYears fallback that uses a finite,
+# ordinary-sized Duration instead. These tests guard against ever reintroducing
+# the oversized value, and independently verify (via the raw Task Scheduler COM
+# API, not the ScheduledTasks module register_task.ps1 itself uses to register)
+# that the chosen "omitted Duration" shape matches Task Scheduler's own
+# schema-correct representation for indefinite repetition.
+
+
+def test_preview_never_contains_the_oversized_duration_string(tmp_path):
+    repo_root = _make_skeleton(tmp_path)
+
+    default_result = _run("register_task.ps1", repo_root, args=["-TaskName", _random_task_name()])
+    finite_result = _run(
+        "register_task.ps1", repo_root,
+        args=["-TaskName", _random_task_name(), "-RepetitionYears", "10"],
+    )
+
+    for result in (default_result, finite_result):
+        assert result.returncode == 0, result.stderr
+        assert "P99999999" not in result.stdout
+        assert "MaxValue" not in result.stdout
+
+
+def test_default_trigger_omits_duration_for_indefinite_repetition(tmp_path):
+    repo_root = _make_skeleton(tmp_path)
+
+    result = _run("register_task.ps1", repo_root, args=["-TaskName", _random_task_name()])
+
+    trigger_line = next(line for line in result.stdout.splitlines() if line.startswith("Trigger"))
+    assert "no repetition end" in trigger_line
+    assert "Duration=" not in trigger_line
+
+
+def test_repetition_years_fallback_uses_a_finite_ordinary_sized_duration(tmp_path):
+    repo_root = _make_skeleton(tmp_path)
+
+    result = _run(
+        "register_task.ps1", repo_root,
+        args=["-TaskName", _random_task_name(), "-RepetitionYears", "10"],
+    )
+
+    trigger_line = next(line for line in result.stdout.splitlines() if line.startswith("Trigger"))
+    assert "Duration=P3650D" in trigger_line
+    assert "P99999999" not in trigger_line
+
+
+def test_repetition_years_rejects_absurdly_large_values(tmp_path):
+    repo_root = _make_skeleton(tmp_path)
+
+    result = _run(
+        "register_task.ps1", repo_root,
+        args=["-TaskName", _random_task_name(), "-RepetitionYears", "999999"],
+    )
+
+    assert result.returncode != 0
+    assert "P99999999" not in result.stdout
+
+
+def _build_time_trigger_xml(*, duration: str | None) -> str:
+    """Builds a real Task Scheduler TimeTrigger directly against the raw Task
+    Scheduler COM API (Schedule.Service.NewTask()) and returns its XmlText - purely
+    local task-definition construction, no elevation needed and no call to the
+    Task Scheduler service, so this never registers anything. An independent
+    cross-check of what real Task Scheduler XML a given Duration configuration
+    produces, separate from the ScheduledTasks-module code path register_task.ps1
+    itself uses."""
+    duration_line = f'$trigger.Repetition.Duration = "{duration}"' if duration else ""
+    script = f"""
+$service = New-Object -ComObject "Schedule.Service"
+$service.Connect()
+$task = $service.NewTask(0)
+$trigger = $task.Triggers.Create(1)
+$trigger.StartBoundary = (Get-Date).ToString("s")
+$trigger.Repetition.Interval = "PT5M"
+{duration_line}
+Write-Output $task.XmlText
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-Command", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_omitted_duration_matches_task_schedulers_schema_for_indefinite_repetition():
+    """The exact configuration register_task.ps1 uses by default (Interval set,
+    Duration never assigned) produces the schema-correct "repeat indefinitely"
+    shape: an <Interval> element but no <Duration> element under <Repetition> at
+    all. This can only confirm the generated XML's *shape* matches Task
+    Scheduler's own documented indefinite-repetition representation, offline and
+    without elevation - it cannot, by itself, prove the live service will accept
+    a real registration (that requires an elevated session; see PROJECT_STATUS.md)."""
+    xml = _build_time_trigger_xml(duration=None)
+    repetition_block = re.search(r"<Repetition>.*?</Repetition>", xml, re.DOTALL).group()
+
+    assert "<Interval>PT5M</Interval>" in repetition_block
+    assert "<Duration>" not in repetition_block
+    assert "P99999999" not in xml
+
+
+def test_the_original_oversized_duration_is_detectable_in_generated_xml():
+    """Proves this regression check would have caught the original bug: explicitly
+    reproducing the old -RepetitionDuration ([TimeSpan]::MaxValue) value shows up
+    verbatim in the generated XML - the exact string the live Task Scheduler
+    service rejected with "out of range" (HRESULT 0x80041318) against a real
+    Windows installation."""
+    xml = _build_time_trigger_xml(duration="P99999999DT23H59M59S")
+
+    assert "<Duration>P99999999DT23H59M59S</Duration>" in xml
 
 
 # --- remove_task.ps1 -----------------------------------------------------------------

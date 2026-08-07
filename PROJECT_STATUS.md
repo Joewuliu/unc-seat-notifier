@@ -1,9 +1,10 @@
 # Project Status
 
-Last updated: 2026-08-07 (after building the Task Scheduler registration workflow -
-`register_task.ps1`/`remove_task.ps1`/`verify_task.ps1` - see §2/§6). Facts below
-were verified directly (pytest/ruff run, git status/log, real manual invocations,
-file listing) at time of writing, not recalled from memory.
+Last updated: 2026-08-07 (after fixing the real registration failure -
+`Duration:P99999999DT23H59M59S ... out of range` - in `register_task.ps1`'s
+trigger; see §2/§6). Facts below were verified directly (pytest/ruff run, git
+status/log, real manual invocations, file listing) at time of writing, not
+recalled from memory.
 
 ## 1. Current architecture and implemented commands
 
@@ -118,7 +119,38 @@ scripts/
 
 ## 2. Key design decisions
 
-**Task Scheduler registration workflow (this session).** Built
+**Trigger repetition-duration bug fix (this session).** The user's first real
+`register_task.ps1 -ConfirmRegister` attempt (elevated session) failed:
+`Register-ScheduledTask: The task XML contains a value which is incorrectly
+formatted or out of range. (8,42):Duration:P99999999DT23H59M59S HRESULT
+0x80041318`. Cause: the trigger was built with
+`-RepetitionDuration ([TimeSpan]::MaxValue)`, intending "repeat every 5 minutes
+forever" - `[TimeSpan]::MaxValue` serializes to the ISO-8601 duration
+`P99999999DT23H59M59S` (~273,785 years), which `New-ScheduledTaskTrigger`/local
+object construction accepts without complaint, but the *live* Task Scheduler
+service rejects as out of range at registration time. Fixed by **omitting
+`-RepetitionDuration` entirely** - Microsoft's documentation states this means the
+repetition never ends, which is also requirement 3's explicitly preferred
+approach. Independently confirmed (not just trusted from docs) by building the
+equivalent trigger directly against the raw Task Scheduler COM API
+(`Schedule.Service.NewTask()` - pure local object construction, no elevation
+needed, no call to the service) and inspecting its real `.XmlText`: the omitted-
+Duration configuration produces `<Repetition><Interval>PT5M</Interval>
+<StopAtDurationEnd>false</StopAtDurationEnd></Repetition>` - no `<Duration>`
+element at all - while explicitly setting `Repetition.Duration =
+"P99999999DT23H59M59S"` on that same COM object round-trips back out
+verbatim, confirming the string itself (not something Register-ScheduledTask
+mangled) is what a real installation rejects. Added an opt-in
+`-RepetitionYears N` fallback (default `0` = omitted/indefinite) in case a future
+Windows version or policy ever requires an explicit Duration - it uses an
+ordinary-sized finite value (`New-TimeSpan -Days ($N * 365)`, e.g. `P3650D` for 10
+years) capped at 100 years via `[ValidateRange(0, 100)]`, nowhere near the value
+that failed. Documented and tested, but not the recommended path, and - like the
+default path - **not verified against a live elevated registration by this
+session** (the user's own next elevated attempt is the real-world confirmation
+still pending; see §6).
+
+**Task Scheduler registration workflow.** Built
 `scripts/register_task.ps1`/`remove_task.ps1`/`verify_task.ps1` to replace
 `show_task_scheduler_command.ps1` as the canonical registration path (that older
 script is left in place, undocumented as the primary path, purely historical).
@@ -227,15 +259,21 @@ session history if full detail is needed; none of these changed this session.
 ## 4. Test count and last run results
 
 ```
-pytest -q  → 187 passed
+pytest -q  → 193 passed
 ruff check .  → All checks passed
 ```
 
 Per-file breakdown (`grep -c '^def test_'`): test_cli.py 46, test_config.py 21,
 test_console_notifier.py 3, test_diff.py 15, test_lock.py 5, test_logging_setup.py 2,
 test_poller.py 27, test_repository.py 13, test_run_poll_launcher.py 5,
-test_scraper_fake.py 5, test_smtp_notifier.py 6, test_task_scheduler_scripts.py 11,
-test_tiled_parser.py 19, test_unc_scraper.py 9. Sum = 187.
+test_scraper_fake.py 5, test_smtp_notifier.py 6, test_task_scheduler_scripts.py 17,
+test_tiled_parser.py 19, test_unc_scraper.py 9. Sum = 193. (`test_task_scheduler_scripts.py`
+grew from 11 to 17 this session: 6 new tests guard the repetition-duration fix -
+two build real Task Scheduler XML directly via the `Schedule.Service` COM API
+(offline, no elevation) to independently verify the omitted-Duration shape and to
+prove the original oversized value is detectable, and four exercise
+`register_task.ps1`'s preview output/`-RepetitionYears` fallback/parameter
+validation.)
 
 `test_run_poll_launcher.py` and (new this session) `test_task_scheduler_scripts.py`
 both run the *real* PowerShell scripts via `powershell.exe` against synthetic repo
@@ -266,34 +304,38 @@ user's separate go-ahead first (see §6).
 
 ## 5. Work completed but not committed
 
-**Since the last status update, the user committed everything through the
-`tiled_parser.py` course-filtering fix** (commit `aa82337 Prepare reliable Windows
-production polling` - includes `poll-once-live`, all prior-session
-production-readiness work, the MATH 231/231L fix, and their own real
-`watches.yaml`). Uncommitted now, per the user's explicit "do not commit"
-direction this session:
+**Since the last status update, the user committed the entire Task Scheduler
+registration workflow** (commit `2d490a7 Add safe Task Scheduler management
+scripts`, on top of `aa82337 Prepare reliable Windows production polling` which
+covers everything through the MATH 231/231L fix). This session's
+repetition-duration fix is layered on top of that and is uncommitted, per the
+user's explicit "do not commit" direction:
 
 ```
  M PROJECT_STATUS.md
  M README.md
-?? scripts/register_task.ps1
-?? scripts/remove_task.ps1
-?? scripts/verify_task.ps1
-?? tests/test_task_scheduler_scripts.py
+ M scripts/register_task.ps1
+ M tests/test_task_scheduler_scripts.py
 ```
+
+(`scripts/remove_task.ps1` and `scripts/verify_task.ps1` are unchanged this
+session and already committed in `2d490a7`.)
 
 ## 6. Next planned phase
 
-**Explicitly not done, and requires the user's separate approval before it
-happens:** registering the actual Windows Task Scheduler task.
-`scripts/register_task.ps1` (default, no flags) only *previews* every setting - it
-never calls `Register-ScheduledTask` unless `-ConfirmRegister` is passed
-explicitly, which has not happened. Real registration (and removal) additionally
-requires an elevated ("Run as Administrator") PowerShell session, confirmed via a
-real "Access is denied" error in this environment under a normal session. The
-natural next step, when the user is ready: review the preview output (§7), open an
-elevated PowerShell session, run `register_task.ps1 -ConfirmRegister`, then
-`verify_task.ps1` to confirm it's really there.
+**The user already made one real, elevated `register_task.ps1 -ConfirmRegister`
+attempt - it failed with the Duration-out-of-range error fixed this session (see
+§2).** Real registration has not succeeded yet. `scripts/register_task.ps1`
+(default, no flags) only *previews* every setting - it never calls
+`Register-ScheduledTask` unless `-ConfirmRegister` is passed explicitly. The
+natural next step, when the user is ready: review the updated preview output
+(§7 - confirm the `Trigger` line now reads "no repetition end" instead of showing
+a Duration value), open an elevated PowerShell session again, re-run
+`register_task.ps1 -ConfirmRegister`, then `verify_task.ps1` to confirm it's
+really there and picking up runs. **This session's fix has not itself been
+verified against a live registration** - only offline, via the independent
+`Schedule.Service` COM XML check described in §2 - so the user's next attempt is
+the real confirmation.
 
 Other open items, not yet acted on: whether to retrofit `poll-once-dry-run` onto
 `Poller.apply_snapshot()`; whether to commit this session's registration-workflow
@@ -352,9 +394,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify_task.ps1
 - **`poll-once-dry-run` still duplicates notify-resolution logic** (`cli.py::
   _attempt_console_notify`) instead of using `Poller.apply_snapshot()` - unchanged,
   flagged in earlier sessions too.
-- **The Task Scheduler task itself is not registered** - `Register-ScheduledTask`
-  was never called this session (only previewed), per explicit instructions. See
-  "next planned phase."
+- **The Task Scheduler task itself is not registered yet.** The user's first real,
+  elevated `-ConfirmRegister` attempt failed on the Duration-out-of-range bug fixed
+  this session (see §2/§6); a second attempt hasn't been made since the fix. This
+  session's own `Register-ScheduledTask` calls were, per explicit instructions,
+  never made (preview only).
+- **The repetition-duration fix is verified offline only** - via an independent
+  `Schedule.Service` COM XML check (see §2), not a live elevated registration
+  (unavailable to this session). It's the most rigorous check obtainable without
+  elevation, and is grounded in the user's own real error message, but "the XML
+  shape matches Task Scheduler's documented indefinite-repetition format" is not
+  quite the same claim as "a live registration with this exact trigger succeeded."
 - **The "task exists → gets removed" path in `remove_task.ps1` is untested
   end-to-end** - registering even a throwaway test task requires elevation, which
   this environment doesn't have non-interactively. Covered only by a source-level

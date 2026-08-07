@@ -300,6 +300,43 @@ Disable-ScheduledTask -TaskName "UNC Seat Notifier"
 objects passed to `Register-ScheduledTask` (not a separate hand-written
 description), so what you see previewed is exactly what gets registered.
 
+#### Why the trigger has no explicit repetition end date
+
+A first real registration attempt failed with:
+
+```
+Register-ScheduledTask: The task XML contains a value which is incorrectly
+formatted or out of range. (8,42):Duration:P99999999DT23H59M59S
+HRESULT 0x80041318
+```
+
+caused by the trigger setting `-RepetitionDuration ([TimeSpan]::MaxValue)`, meant
+to express "repeat every 5 minutes forever." `[TimeSpan]::MaxValue` serializes to
+the ISO-8601 duration `P99999999DT23H59M59S` (~273,785 years), which the *live*
+Task Scheduler service rejects as out of range at registration time - even though
+building that same value into a trigger object locally doesn't error until you
+actually try to register it.
+
+The fix: **omit `-RepetitionDuration` entirely.** Per Microsoft's own
+documentation, leaving it unset while `-RepetitionInterval` is set means the
+repetition never ends - and building the equivalent trigger directly against the
+Task Scheduler COM API (`Schedule.Service` - no elevation needed, since it only
+builds an in-memory task definition and never calls the service) confirms the
+resulting XML has no `<Duration>` element under `<Repetition>` at all, which is the
+schema-correct "repeat indefinitely" shape. This is what `register_task.ps1` does
+by default now.
+
+If a future Windows version or policy ever requires an explicit (non-omitted)
+Duration for repetition to actually take effect, `register_task.ps1` has an opt-in
+`-RepetitionYears N` fallback (e.g. `-RepetitionYears 10`) that sets a finite,
+ordinary-sized Duration instead (`P3650D` for 10 years - nowhere near the value
+that failed). Unlike the default, a finite Duration means the trigger **stops
+firing new repetitions once that many years have elapsed since registration** -
+Task Scheduler does not auto-renew it, so you'd need to re-run `register_task.ps1
+-ConfirmRegister` again before then to keep polling going. This fallback is
+documented but not the recommended path, and hasn't been verified against a live,
+elevated registration (unavailable in this environment).
+
 **Never scrapes UNC, sends email, or embeds any secret** - the registered command
 is only ever `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
 "...\run_poll.ps1"`; `run_poll.ps1` itself reads `.env` at run time, so no

@@ -1,9 +1,9 @@
 # Project Status
 
-Last updated: 2026-08-06 (after fixing a real-production course-filtering bug in
-`tiled_parser.py` - see §2/§8). Facts below were verified directly (pytest/ruff run,
-git status, real manual invocations, file listing) at time of writing, not recalled
-from memory.
+Last updated: 2026-08-07 (after building the Task Scheduler registration workflow -
+`register_task.ps1`/`remove_task.ps1`/`verify_task.ps1` - see §2/§6). Facts below
+were verified directly (pytest/ruff run, git status/log, real manual invocations,
+file listing) at time of writing, not recalled from memory.
 
 ## 1. Current architecture and implemented commands
 
@@ -55,9 +55,16 @@ src/unc_notifier/
     repository.py, schema.sql   # SQLite persistence: section_state, observations
                                  # (append-only), course_fetch_health
 scripts/
-  run_poll.ps1                  # Windows Task Scheduler launcher. New this session.
-  show_task_scheduler_command.ps1  # Prints (never runs) the schtasks registration
-                                    # command. New this session.
+  run_poll.ps1                    # Windows Task Scheduler launcher.
+  register_task.ps1                # New this session. Previews (default) or, with
+                                    # -ConfirmRegister, registers the scheduled task
+                                    # via the ScheduledTasks PowerShell module.
+  remove_task.ps1                   # New this session. Previews (default) or, with
+                                     # -ConfirmRemove, unregisters it.
+  verify_task.ps1                    # New this session. Read-only status report
+                                      # (state, last run/result, next run, logs).
+  show_task_scheduler_command.ps1      # Superseded by register_task.ps1 - kept only
+                                        # as a historical schtasks.exe-based reference.
 ```
 
 **CLI commands (all wired, all tested):**
@@ -111,7 +118,35 @@ scripts/
 
 ## 2. Key design decisions
 
-**Course-card filtering bug fix (this session).** A real production `poll` run for
+**Task Scheduler registration workflow (this session).** Built
+`scripts/register_task.ps1`/`remove_task.ps1`/`verify_task.ps1` to replace
+`show_task_scheduler_command.ps1` as the canonical registration path (that older
+script is left in place, undocumented as the primary path, purely historical).
+Two decisions worth recording:
+
+- **Uses the `ScheduledTasks` PowerShell module (`Register-ScheduledTask` and
+  friends), not `schtasks.exe`.** Several required settings - execution time limit,
+  restart count/interval, "start as soon as possible after a missed start", running
+  on battery - aren't expressible through `schtasks.exe`'s `/Create` flags, but map
+  directly onto `New-ScheduledTaskSettingsSet` parameters. This was close to a
+  forced move given the requested settings list, not really a judgment call between
+  comparable options.
+- **`register_task.ps1`'s preview output is generated from the literal
+  action/trigger/settings/principal objects that would be passed to
+  `Register-ScheduledTask`**, not a separate hand-written description - so what gets
+  previewed can't drift out of sync with what actually gets registered. Those
+  constructor cmdlets (`New-ScheduledTaskAction` etc.) have no side effects on their
+  own; only the final `Register-ScheduledTask` call (gated behind `-ConfirmRegister`)
+  touches the real Task Scheduler store. This also makes the preview path fully
+  testable without ever registering anything for real.
+
+Confirmed in this environment that registering (or removing) a real scheduled task
+under the recommended `SYSTEM` account requires an elevated ("Run as
+Administrator") PowerShell session - a non-elevated `Register-ScheduledTask` call
+fails with "Access is denied." All three new scripts, and their tests, account for
+this: registration/removal were never exercised for real (see §4/§6).
+
+**Course-card filtering bug fix (prior session).** A real production `poll` run for
 MATH 231-001 raised a fetch failure: UNC's real Tiled Search, when searched with
 `catalog_number=231`, also returned a card for the related-but-distinct `MATH 231L`
 (a lab section with its own catalog number). The old `parse_tiled_search()` had no
@@ -192,83 +227,77 @@ session history if full detail is needed; none of these changed this session.
 ## 4. Test count and last run results
 
 ```
-pytest -q  → 176 passed
+pytest -q  → 187 passed
 ruff check .  → All checks passed
 ```
 
 Per-file breakdown (`grep -c '^def test_'`): test_cli.py 46, test_config.py 21,
 test_console_notifier.py 3, test_diff.py 15, test_lock.py 5, test_logging_setup.py 2,
 test_poller.py 27, test_repository.py 13, test_run_poll_launcher.py 5,
-test_scraper_fake.py 5, test_smtp_notifier.py 6, test_tiled_parser.py 19,
-test_unc_scraper.py 9. Sum = 176. (`test_tiled_parser.py` grew from 13 to 19 tests
-this session: `parse_tiled_search()` gained a required `course_key` parameter, three
-tests that previously parsed the whole `subject_all` fixture unfiltered were
-repurposed into filtering-specific tests, and 6 new tests cover the MATH 231/231L
-regression plus the unrelated-malformed-card-still-fails case.)
+test_scraper_fake.py 5, test_smtp_notifier.py 6, test_task_scheduler_scripts.py 11,
+test_tiled_parser.py 19, test_unc_scraper.py 9. Sum = 187.
 
-`test_run_poll_launcher.py` runs the *real* `scripts/run_poll.ps1` via
-`powershell.exe` against synthetic repo skeletons under `tmp_path` (never this
-checkout's real `.env`/venv) - `pytest.mark.skipif` if `powershell.exe`/`pwsh`
-isn't on `PATH`. `test_lock.py` exercises the real Windows `msvcrt` file lock
-directly, including a simulated-crash scenario (lock acquired and the file handle
-closed without unlocking, proving a later acquisition still succeeds).
+`test_run_poll_launcher.py` and (new this session) `test_task_scheduler_scripts.py`
+both run the *real* PowerShell scripts via `powershell.exe` against synthetic repo
+skeletons under `tmp_path` (never this checkout's real `.env`/`watches.yaml`/venv) -
+`pytest.mark.skipif` if `powershell.exe`/`pwsh` isn't on `PATH`. `test_lock.py`
+exercises the real Windows `msvcrt` file lock directly, including a
+simulated-crash scenario.
 
-Also manually verified for real in the prior (production-readiness) session (all
-read-only/safe): `production-check` against this repo's real `.env` (at that time
-correctly reported `[FAIL] Watches file exists`, since no real `watches.yaml`
-existed yet); `scripts\run_poll.ps1 -DryRun` from both the repo root and an
-unrelated directory (`C:\Windows\System32`), confirming identical resolved paths;
-`scripts\show_task_scheduler_command.ps1` (prints the `schtasks` command, registers
-nothing). The real (non-dry-run) launcher, and `schtasks` itself, were **not**
-executed. Since then the user created a real `watches.yaml` (untracked, not part of
-this project's own committed work) and ran a real scheduled `poll` against it -
-which is exactly what surfaced this session's MATH 231/231L bug (see §2/§8).
+**`test_task_scheduler_scripts.py` never registers or removes a real scheduled
+task** - confirmed in this environment that doing so under the recommended
+`SYSTEM` account requires an elevated PowerShell session
+(`Register-ScheduledTask` fails with "Access is denied" otherwise), so every test
+exercises only `register_task.ps1`'s/`remove_task.ps1`'s preview paths (which never
+call `Register-ScheduledTask`/`Unregister-ScheduledTask`) plus the read-only
+"task doesn't exist" paths, always against a random `-TaskName` so nothing can
+collide with a real "UNC Seat Notifier" task on this machine. The "task exists,
+gets removed for real" path is covered only by a source-level regression check
+(the `-ConfirmRemove` guard appears before the `Unregister-ScheduledTask` call) -
+see known limitations.
+
+Also manually verified for real this session (all read-only/safe, via the actual
+`scripts\register_task.ps1`/`remove_task.ps1`/`verify_task.ps1` against this real
+checkout): preview mode's full settings table (see §7 output below); `verify_task.ps1`
+and `remove_task.ps1` both correctly reporting "no task named 'UNC Seat Notifier'
+exists" (it isn't registered yet). Real registration was **not** attempted - it
+would need an elevated session and, per this session's instructions, requires the
+user's separate go-ahead first (see §6).
 
 ## 5. Work completed but not committed
 
-Last commit: `57f8b6a Add controlled SMTP test command`. Everything since then
-(`poll-once-live` and the production-readiness work from prior sessions, plus this
-session's `tiled_parser.py` course-filtering fix) is uncommitted, per the user's
-explicit direction throughout:
+**Since the last status update, the user committed everything through the
+`tiled_parser.py` course-filtering fix** (commit `aa82337 Prepare reliable Windows
+production polling` - includes `poll-once-live`, all prior-session
+production-readiness work, the MATH 231/231L fix, and their own real
+`watches.yaml`). Uncommitted now, per the user's explicit "do not commit"
+direction this session:
 
 ```
- M .env.example
  M PROJECT_STATUS.md
  M README.md
- M src/unc_notifier/cli.py
- M src/unc_notifier/config.py
- M src/unc_notifier/scraper/tiled_parser.py
- M src/unc_notifier/scraper/unc.py
- M tests/test_cli.py
- M tests/test_config.py
- M tests/test_tiled_parser.py
- M watches.yaml.example
-?? scripts/                          (run_poll.ps1, show_task_scheduler_command.ps1)
-?? src/unc_notifier/lock.py
-?? tests/fixtures/unc_class_search_tiled_math231_only_related.html
-?? tests/fixtures/unc_class_search_tiled_math231_with_231l.html
-?? tests/test_lock.py
-?? tests/test_run_poll_launcher.py
+?? scripts/register_task.ps1
+?? scripts/remove_task.ps1
+?? scripts/verify_task.ps1
+?? tests/test_task_scheduler_scripts.py
 ```
-
-(`src/unc_notifier/poller.py` and `README.md`'s `poll-once-live` section from the
-prior session remain uncommitted too, unchanged by this session.)
 
 ## 6. Next planned phase
 
-**Explicitly not done, and requires the user's separate approval before it happens:**
-registering the actual Windows Task Scheduler task. `scripts/show_task_scheduler_command.ps1`
-prints the exact `schtasks /create` command but does not run it - per this
-session's instructions, `schtasks`/the `ScheduledTasks` PowerShell module were
-never invoked. The natural next step, when the user is ready, is: run
-`production-check`, run the real (non-dry-run) launcher once manually to see a real
-poll end-to-end under the launcher, then either run the printed `schtasks` command
-or use Task Scheduler's GUI with the same values, then set the GUI-only Properties
-(stop-if-longer-than, restart-on-failure, "don't start a new instance") documented
-in README.md.
+**Explicitly not done, and requires the user's separate approval before it
+happens:** registering the actual Windows Task Scheduler task.
+`scripts/register_task.ps1` (default, no flags) only *previews* every setting - it
+never calls `Register-ScheduledTask` unless `-ConfirmRegister` is passed
+explicitly, which has not happened. Real registration (and removal) additionally
+requires an elevated ("Run as Administrator") PowerShell session, confirmed via a
+real "Access is denied" error in this environment under a normal session. The
+natural next step, when the user is ready: review the preview output (§7), open an
+elevated PowerShell session, run `register_task.ps1 -ConfirmRegister`, then
+`verify_task.ps1` to confirm it's really there.
 
 Other open items, not yet acted on: whether to retrofit `poll-once-dry-run` onto
-`Poller.apply_snapshot()`; whether to move toward committing this work.
+`Poller.apply_snapshot()`; whether to commit this session's registration-workflow
+scripts.
 
 ## 7. Commands to verify locally
 
@@ -282,8 +311,11 @@ Other open items, not yet acted on: whether to retrofit `poll-once-dry-run` onto
 # Launcher dry run - prints resolved paths, touches nothing:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_poll.ps1 -DryRun
 
-# Prints (never runs) the Task Scheduler registration command:
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/show_task_scheduler_command.ps1
+# Preview the Task Scheduler registration - prints every setting, registers nothing:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register_task.ps1
+
+# Read-only status report (works before or after registration):
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify_task.ps1
 
 # Read-only live smoke test (only needs CONTACT_EMAIL in .env):
 ./.venv/Scripts/python.exe -m unc_notifier scrape-once --term "2026 Fall" --subject COMP --catalog-number 210
@@ -308,10 +340,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/show_task_scheduler_
 
 ## 8. Known limitations / technical debt
 
-- **A real `watches.yaml` now exists** (created by the user since the prior
-  session's status was written; untracked, not part of this project's own
-  committed work) - it was a real scheduled `poll` run against it, watching MATH
-  231-001, that surfaced this session's course-filtering bug.
+- **A real `watches.yaml` exists and is now committed** (part of `aa82337`,
+  including the user's real course watches) - it was a real scheduled `poll` run
+  against it, watching MATH 231-001, that surfaced the course-filtering bug fixed
+  in the prior session.
 - **Exact-match filtering is per-request, not per-family** - watching MATH 231L
   specifically (e.g. to get its own seat alerts) requires its own separate
   `watches.yaml` entry with `catalog_number: "231L"`; there's no "watch 231 and
@@ -320,9 +352,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/show_task_scheduler_
 - **`poll-once-dry-run` still duplicates notify-resolution logic** (`cli.py::
   _attempt_console_notify`) instead of using `Poller.apply_snapshot()` - unchanged,
   flagged in earlier sessions too.
-- **The Task Scheduler task itself is not registered** - `schtasks`/`ScheduledTasks`
-  were never invoked this session, per explicit instructions. See "next planned
-  phase."
+- **The Task Scheduler task itself is not registered** - `Register-ScheduledTask`
+  was never called this session (only previewed), per explicit instructions. See
+  "next planned phase."
+- **The "task exists → gets removed" path in `remove_task.ps1` is untested
+  end-to-end** - registering even a throwaway test task requires elevation, which
+  this environment doesn't have non-interactively. Covered only by a source-level
+  regression check that the `-ConfirmRemove` guard precedes the real
+  `Unregister-ScheduledTask` call; worth a manual elevated-session smoke test
+  before relying on it in anger.
 - **`single_instance_lock()` is Windows-only** (`msvcrt`) - deliberate, matches this
   feature's Windows/Task Scheduler scope, but the code would need a different
   implementation (e.g. `fcntl`) to ever run on Linux/macOS.

@@ -175,7 +175,12 @@ unc-seat-notifier/
     unc_notifier.log            # structured JSON-lines application log (LOG_PATH)
   scripts/
     run_poll.ps1                 # the Task Scheduler launcher
-    show_task_scheduler_command.ps1  # prints (never runs) the schtasks command
+    register_task.ps1             # previews, and (with -ConfirmRegister) registers,
+                                    # the scheduled task
+    remove_task.ps1                # previews, and (with -ConfirmRemove) removes it
+    verify_task.ps1                  # read-only status report for the registered task
+    show_task_scheduler_command.ps1    # superseded by register_task.ps1 - kept only
+                                        # as a historical schtasks.exe-based reference
 ```
 
 `DB_PATH`, `LOG_PATH`, `WATCHES_PATH`, and `LOCK_PATH` in `.env` are all resolved
@@ -231,37 +236,83 @@ detail afterward.
 
 ### Task Scheduler setup
 
+`scripts/register_task.ps1` registers the task with the
+[`ScheduledTasks`](https://learn.microsoft.com/powershell/module/scheduledtasks/)
+PowerShell module rather than `schtasks.exe` - several of the required settings
+(execution time limit, restart count/interval, "start as soon as possible after a
+missed start") aren't expressible through `schtasks.exe`'s `/Create` flags, but map
+directly onto that module's cmdlets. **Default mode only ever previews** - it never
+calls `Register-ScheduledTask` unless you pass `-ConfirmRegister` explicitly.
+
+#### The exact safe sequence
+
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\show_task_scheduler_command.ps1
+# a. Confirm everything poll needs is actually in place (read-only):
+.\.venv\Scripts\python.exe -m unc_notifier production-check
+
+# b. Run the real launcher once by hand, exactly as Task Scheduler will invoke it:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_poll.ps1
+
+# c. Preview the registration - prints every setting, registers nothing:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_task.ps1
+
+# d. Only once you've reviewed (c) and are ready: register for real. This requires
+#    an elevated ("Run as Administrator") PowerShell session - Register-ScheduledTask
+#    fails with "Access is denied" otherwise:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_task.ps1 -ConfirmRegister
+
+# e. Verify it's really there and picking up runs (read-only):
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify_task.ps1
+
+# f. Inspect logs after a few runs:
+#    logs\poll_<date>.log        - raw stdout/stderr per run, dated
+#    logs\unc_notifier.log       - structured JSON-lines detail (fetches, state
+#                                  transitions, notification attempts/outcomes)
+#    Task Scheduler's own History tab - run start/end times and exit codes
+
+# g. Disable or remove when you want to stop:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\remove_task.ps1              # preview
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\remove_task.ps1 -ConfirmRemove  # for real
+# - or, to pause without deleting the registration:
+Disable-ScheduledTask -TaskName "UNC Seat Notifier"
 ```
 
-This prints the exact `schtasks /create ...` command to register the task (program:
-`powershell.exe`, arguments: `-NoProfile -ExecutionPolicy Bypass -File
-"...\scripts\run_poll.ps1"`, no "Start in" directory needed since the launcher
-resolves its own paths) - **it does not run it**. Review the printed command, then
-run it yourself (as Administrator) when ready. It registers the task to run every 5
-minutes, whether the user is logged on or not (`/RU SYSTEM`, which avoids having to
-store a password for "run whether logged on or not"), limited to standard user
-privileges (`/RL LIMITED`).
+#### What gets registered
 
-The script also prints a few settings that only exist in Task Scheduler's own
-Properties dialog (not expressible via `schtasks /create` flags) to set by hand
-afterward: "stop the task if it runs longer than" (a generous safety ceiling - a
-poll should finish in seconds), "restart on failure", and "do not start a new
-instance if one is already running" (belt-and-suspenders alongside `poll`'s own
-`single_instance_lock()`, which already refuses a second overlapping run on its
-own).
+| Setting | Value |
+|---|---|
+| Task name | `UNC Seat Notifier` |
+| Program | the resolved path to `powershell.exe` |
+| Arguments | `-NoProfile -ExecutionPolicy Bypass -File "<repo>\scripts\run_poll.ps1"` |
+| Start in | the repository root (though the launcher resolves its own paths regardless) |
+| Trigger | every 5 minutes, starting immediately, indefinitely |
+| User account context | `SYSTEM` - runs whether logged on or not, with no stored password (SYSTEM has none) |
+| Run level | Limited (standard user privileges, not "highest") |
+| Overlap behavior | `MultipleInstances=IgnoreNew` - a second scheduled run is skipped while one is still in progress. Belt-and-suspenders: `poll` already refuses to run concurrently on its own via `single_instance_lock()` |
+| Maximum runtime | 4 minutes (a poll normally finishes in seconds - generous safety ceiling) |
+| Restart on failure | up to 3 times, 1 minute apart |
+| Missed-start behavior | starts as soon as possible if a scheduled run was missed (e.g. the computer was off) |
+| Runs on battery | yes, and does not stop if switching to battery mid-run |
+| Wakes the computer | no |
+| Logs | `logs\poll_<date>.log` (launcher) and `logs\unc_notifier.log` (structured) |
 
-To inspect what happened after the fact: Task Scheduler's own history tab shows
-run start/end times and exit codes; `logs\poll_<date>.log` has the raw
-console/error output for that day; `logs\unc_notifier.log` (JSON-lines) has the
-structured detail - per-course fetch results, state transitions, notification
-attempts and outcomes, for every run.
+`scripts\register_task.ps1`'s preview output is generated directly from the exact
+objects passed to `Register-ScheduledTask` (not a separate hand-written
+description), so what you see previewed is exactly what gets registered.
+
+**Never scrapes UNC, sends email, or embeds any secret** - the registered command
+is only ever `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+"...\run_poll.ps1"`; `run_poll.ps1` itself reads `.env` at run time, so no
+credential is ever written into the task definition, and none of `register_task.ps1`
+/`remove_task.ps1`/`verify_task.ps1` reads or prints `SMTP_USERNAME`/`SMTP_PASSWORD`.
+Registering under a real user account instead of `SYSTEM` (not what these scripts
+do by default) is the one case where Windows would prompt you for that account's
+password at registration time, to store it for unattended logon.
 
 ### Rollback / disable
 
-To stop scheduled polling without deleting anything: open Task Scheduler, find
-"UNC Seat Notifier", and either **Disable** it (keeps the task definition, stops it
-from running) or **Delete** it (removes the task entirely - `run_poll.ps1`,
-`.env`, `watches.yaml`, and `data\unc_notifier.db` are all untouched either way, so
-re-registering later picks up exactly where it left off).
+To stop scheduled polling without deleting anything: `Disable-ScheduledTask
+-TaskName "UNC Seat Notifier"` (keeps the registration, stops it from running) or
+`scripts\remove_task.ps1 -ConfirmRemove` (removes the registration entirely -
+`run_poll.ps1`, `.env`, `watches.yaml`, and `data\unc_notifier.db` are all untouched
+either way, so registering again later picks up exactly where it left off).

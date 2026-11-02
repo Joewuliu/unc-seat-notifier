@@ -3,6 +3,16 @@
 Single-user CLI/cron seat-availability notifier for UNC Chapel Hill course sections.
 See [SPEC.md](SPEC.md) for the full project specification.
 
+## Example Notification
+
+When a watched section transitions from closed to available, the notifier detects the change during its scheduled poll and sends an email with the current seat count and transition details.
+
+<p align="center">
+  <img src="docs/screenshots/email-alert.png"
+       alt="UNC Seat Notifier email alert"
+       width="850">
+</p>
+
 ## Setup
 
 Copy `.env.example` to `.env` and `watches.yaml.example` to `watches.yaml`, then fill
